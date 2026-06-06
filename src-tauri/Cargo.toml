@@ -1,0 +1,27 @@
+[package]
+name = "turbothecat"
+version = "0.1.0"
+description = "Turbo the CAT (Coding Agent Terminal) — a cute desktop AI companion that drives Claude / Codex agents."
+authors = ["Sid"]
+edition = "2021"
+
+[lib]
+name = "turbothecat_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "rt", "rt-multi-thread", "macros"] }
+chrono = { version = "0.4", features = ["clock"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

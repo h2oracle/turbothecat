@@ -1,0 +1,21 @@
+# Dependencies
+/node_modules
+**/node_modules
+
+# Build output
+/dist
+/src-tauri/target
+/src-tauri/gen/schemas
+
+# Built native helper (produced by scripts/build-listener.sh)
+/helpers/turbo-listen
+/helpers/TurboListen.app
+
+# Local runtime / user data
+.turbothecat/
+
+# OS / editor cruft
+.DS_Store
+*.log
+.vscode/
+.idea/
