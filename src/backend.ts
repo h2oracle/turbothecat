@@ -181,6 +181,18 @@ export async function gitAiMessage(repo: string): Promise<string> {
 export async function gitCommit(repo: string, message: string): Promise<string> {
   return invoke("git_commit", { repo, message });
 }
+export async function gitUnpushed(repo: string): Promise<string[]> {
+  return invoke("git_unpushed", { repo });
+}
+export async function gitUnpulled(repo: string): Promise<string[]> {
+  return invoke("git_unpulled", { repo });
+}
+export async function gitLog(repo: string): Promise<string> {
+  return invoke("git_log", { repo });
+}
+export async function gitFetch(repo: string): Promise<string> {
+  return invoke("git_fetch", { repo });
+}
 export async function gitPull(repo: string): Promise<string> {
   return invoke("git_pull", { repo });
 }

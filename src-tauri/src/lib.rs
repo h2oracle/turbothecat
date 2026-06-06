@@ -110,6 +110,9 @@ pub struct RunResult {
 /// Run one prompt through the chosen backend, streaming text to the webview via
 /// `turbo://chunk` and tool activity via `turbo://tool`. Resolves with the run's
 /// cost/token totals when the process exits.
+///
+/// If resuming a saved session fails because it no longer exists, we retry once
+/// without it so the message still goes through (as a fresh conversation).
 #[tauri::command]
 async fn ask_agent(
     window: tauri::Window,
@@ -120,6 +123,34 @@ async fn ask_agent(
     model: Option<String>,
     #[allow(non_snake_case)] sessionId: Option<String>,
 ) -> Result<RunResult, String> {
+    let has_session = sessionId.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let first = run_agent_once(
+        window.clone(),
+        backend.clone(),
+        prompt.clone(),
+        cwd.clone(),
+        permissionMode.clone(),
+        model.clone(),
+        sessionId.clone(),
+    )
+    .await;
+    match first {
+        Err(e) if has_session && (e.contains("No conversation found") || e.contains("session ID")) => {
+            run_agent_once(window, backend, prompt, cwd, permissionMode, model, None).await
+        }
+        other => other,
+    }
+}
+
+async fn run_agent_once(
+    window: tauri::Window,
+    backend: String,
+    prompt: String,
+    cwd: Option<String>,
+    permission_mode: Option<String>,
+    model: Option<String>,
+    session_id: Option<String>,
+) -> Result<RunResult, String> {
     let mut cmd = match backend.as_str() {
         "claude" => {
             let mut c = Command::new("claude");
@@ -128,7 +159,7 @@ async fn ask_agent(
                 .arg("--output-format")
                 .arg("stream-json")
                 .arg("--verbose");
-            if let Some(mode) = permissionMode.as_ref().filter(|m| !m.is_empty()) {
+            if let Some(mode) = permission_mode.as_ref().filter(|m| !m.is_empty()) {
                 c.arg("--permission-mode").arg(mode);
             }
             if let Some(m) = model.as_ref().filter(|m| !m.is_empty()) {
@@ -137,7 +168,7 @@ async fn ask_agent(
             if let Some(p) = persona() {
                 c.arg("--append-system-prompt").arg(p);
             }
-            if let Some(sid) = sessionId.as_ref().filter(|s| !s.is_empty()) {
+            if let Some(sid) = session_id.as_ref().filter(|s| !s.is_empty()) {
                 c.arg("--resume").arg(sid);
             }
             c
@@ -858,6 +889,37 @@ fn git_commit(repo: String, message: String) -> Result<String, String> {
     run_git(&repo, &["commit", "-m", &message])
 }
 
+/// Commits we have that the upstream doesn't (unpushed). Empty if no upstream.
+#[tauri::command]
+fn git_unpushed(repo: String) -> Vec<String> {
+    run_git(&repo, &["log", "@{u}..HEAD", "--oneline", "--color=never"])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Commits the upstream has that we don't (unpulled). Reflects the last fetch.
+#[tauri::command]
+fn git_unpulled(repo: String) -> Vec<String> {
+    run_git(&repo, &["log", "HEAD..@{u}", "--oneline", "--color=never"])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// The commit graph (all branches), decorated so HEAD shows where we are.
+#[tauri::command]
+fn git_log(repo: String) -> Result<String, String> {
+    run_git(
+        &repo,
+        &["log", "--graph", "--oneline", "--decorate", "--all", "-40", "--color=never"],
+    )
+}
+
+/// Refresh remote-tracking refs so unpulled/behind counts are accurate.
+#[tauri::command]
+fn git_fetch(repo: String) -> Result<String, String> {
+    run_git(&repo, &["fetch", "--all", "--prune"])
+}
+
 #[tauri::command]
 fn git_pull(repo: String) -> Result<String, String> {
     run_git(&repo, &["pull", "--ff-only"])
@@ -887,6 +949,10 @@ pub fn run() {
             git_status,
             git_ai_message,
             git_commit,
+            git_unpushed,
+            git_unpulled,
+            git_log,
+            git_fetch,
             git_pull,
             git_push
         ])

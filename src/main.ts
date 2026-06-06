@@ -18,6 +18,10 @@ import {
   gitStatus,
   gitAiMessage,
   gitCommit,
+  gitUnpushed,
+  gitUnpulled,
+  gitLog,
+  gitFetch,
   gitPull,
   gitPush,
   type Backend,
@@ -1307,6 +1311,47 @@ async function renderGit(tab: Tab) {
     }
   }
 
+  function commitSection(title: string, commits: string[], empty: string): HTMLElement {
+    const sec = document.createElement("div");
+    sec.className = "gd-sec";
+    const h = document.createElement("div");
+    h.className = "gd-sect";
+    h.textContent = title;
+    sec.appendChild(h);
+    if (!commits.length) {
+      const e = document.createElement("div");
+      e.className = "hinfo";
+      e.textContent = empty;
+      sec.appendChild(e);
+    } else {
+      for (const c of commits) {
+        const r = document.createElement("div");
+        r.className = "gd-commit";
+        r.textContent = c;
+        sec.appendChild(r);
+      }
+    }
+    return sec;
+  }
+
+  function treeSection(log: string): HTMLElement {
+    const sec = document.createElement("div");
+    sec.className = "gd-sec";
+    const h = document.createElement("div");
+    h.className = "gd-sect";
+    h.textContent = "History";
+    sec.appendChild(h);
+    const pre = document.createElement("pre");
+    pre.className = "gd-log";
+    // highlight the line where HEAD is so you can see where you are in the tree
+    pre.innerHTML = (log || "(no commits)")
+      .split("\n")
+      .map((l) => (/\bHEAD\b/.test(l) ? `<span class="gd-here">${escapeText(l)}</span>` : escapeText(l)))
+      .join("\n");
+    sec.appendChild(pre);
+    return sec;
+  }
+
   async function showRepo(repo: string) {
     const detail = main.querySelector<HTMLElement>(".git-detail");
     if (!detail) return;
@@ -1322,13 +1367,22 @@ async function renderGit(tab: Tab) {
       detail.appendChild(d);
       return;
     }
+    const [unpushed, unpulled, log] = await Promise.all([
+      gitUnpushed(repo).catch(() => [] as string[]),
+      gitUnpulled(repo).catch(() => [] as string[]),
+      gitLog(repo).catch(() => ""),
+    ]);
     detail.innerHTML = "";
 
     const head = document.createElement("div");
     head.className = "gd-head";
-    const ab =
-      (st.ahead ? ` ↑${st.ahead}` : "") + (st.behind ? ` ↓${st.behind}` : "");
-    head.innerHTML = `<span class="gd-branch">⎇ ${escapeText(st.branch)}</span><span class="gd-ab">${escapeText(ab)}</span>`;
+    const br = document.createElement("span");
+    br.className = "gd-branch";
+    br.textContent = `⎇ ${st.branch}`;
+    const counts = document.createElement("span");
+    counts.className = "gd-ab";
+    counts.textContent = `↑${unpushed.length} unpushed · ↓${unpulled.length} unpulled`;
+    head.append(br, counts);
     detail.appendChild(head);
 
     const filesBox = document.createElement("div");
@@ -1396,6 +1450,13 @@ async function renderGit(tab: Tab) {
       msg.value = "";
       showRepo(repo);
     });
+    const fetch = mkBtn("⟳ Fetch", "", async () => {
+      out.classList.remove("err");
+      out.textContent = "Fetching…";
+      const r = await withAgent("", () => gitFetch(repo));
+      out.textContent = r.trim() || "Fetched ✓";
+      showRepo(repo);
+    });
     const pull = mkBtn("⇩ Pull", "", async () => {
       out.classList.remove("err");
       out.textContent = "Pulling…";
@@ -1410,11 +1471,13 @@ async function renderGit(tab: Tab) {
       out.textContent = r.trim() || "Pushed ✓";
       showRepo(repo);
     });
-    const refresh = mkBtn("↻", "", async () => {
-      showRepo(repo);
-    });
-    bar.append(ai, commit, pull, push, refresh);
+    const refresh = mkBtn("↻", "", async () => showRepo(repo));
+    bar.append(ai, commit, fetch, pull, push, refresh);
     detail.append(bar, out);
+
+    detail.appendChild(commitSection(`Unpushed (${unpushed.length})`, unpushed, "All pushed ✓"));
+    detail.appendChild(commitSection(`Unpulled (${unpulled.length})`, unpulled, "Nothing to pull ✓"));
+    detail.appendChild(treeSection(log));
   }
 
   scan();

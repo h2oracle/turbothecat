@@ -24,6 +24,22 @@ body {
   color: var(--fg);
 }
 
+/* let chat / terminal / git content be selected & copied */
+.views,
+.msg,
+.term,
+.tl-io,
+.gd-files,
+.gd-commit,
+.gd-log,
+.gd-out,
+.prompt,
+.gd-msg {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+
 #app {
   position: relative;
   width: 100vw;
@@ -841,6 +857,47 @@ body {
 }
 .gd-out.err {
   color: var(--danger);
+}
+.gd-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.gd-sect {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.gd-commit {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  color: #cfd6e6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gd-log {
+  background: #0c0d12;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #aeb6c6;
+  overflow-x: auto;
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre;
+}
+.gd-log .gd-here {
+  color: #06221d;
+  background: var(--accent);
+  border-radius: 3px;
+  padding: 0 3px;
+  font-weight: 700;
 }
 
 /* popups: slash + tab menu */
