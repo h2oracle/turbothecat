@@ -254,13 +254,39 @@ fn handle_claude_line(win: &tauri::Window, line: &str, result: &mut RunResult) {
                         Some("tool_use") => {
                             let name =
                                 block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                            let input = block
-                                .get("input")
-                                .map(summarize_tool_input)
-                                .unwrap_or_default();
-                            let _ = win.emit("turbo://tool", format!("{name} {input}"));
+                            let id = block.get("id").and_then(|n| n.as_str()).unwrap_or("");
+                            let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                            let payload = serde_json::json!({
+                                "kind": "use", "id": id, "name": name, "input": input,
+                            });
+                            let _ = win.emit("turbo://tool", payload.to_string());
                         }
                         _ => {}
+                    }
+                }
+            }
+        }
+        // tool_result blocks arrive as "user" messages referencing the tool_use id
+        Some("user") => {
+            if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        let ok = !block
+                            .get("is_error")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false);
+                        let mut text = tool_result_text(block.get("content"));
+                        if text.chars().count() > 4000 {
+                            text = text.chars().take(4000).collect::<String>() + "…";
+                        }
+                        let payload = serde_json::json!({
+                            "kind": "result", "id": id, "ok": ok, "text": text,
+                        });
+                        let _ = win.emit("turbo://tool", payload.to_string());
                     }
                 }
             }
@@ -279,15 +305,18 @@ fn handle_claude_line(win: &tauri::Window, line: &str, result: &mut RunResult) {
     }
 }
 
-/// A short one-liner describing a tool call, e.g. the command being run.
-fn summarize_tool_input(input: &serde_json::Value) -> String {
-    for key in ["command", "file_path", "path", "pattern", "url"] {
-        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
-            let s = s.replace('\n', " ");
-            return if s.len() > 80 { format!("{}…", &s[..80]) } else { s };
-        }
+/// Extract the text from a tool_result's `content`, which may be a plain string
+/// or an array of `{type:"text", text:"…"}` blocks.
+fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
-    String::new()
 }
 
 #[derive(Serialize)]

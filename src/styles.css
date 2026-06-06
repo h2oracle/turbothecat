@@ -358,17 +358,134 @@ body {
   align-self: flex-start;
   background: rgba(255, 255, 255, 0.06);
   max-width: 94%;
+  white-space: normal; /* rendered markdown / timeline, not preformatted text */
 }
 .msg.bot.error {
   background: rgba(255, 107, 107, 0.14);
   color: var(--danger);
 }
-.msg .tool {
-  display: block;
-  font-size: 11px;
+
+/* rendered markdown inside a bot reply */
+.msg.bot .md p,
+.msg.bot > p {
+  margin: 0 0 6px;
+}
+.msg.bot .md p:last-child,
+.msg.bot > p:last-child {
+  margin-bottom: 0;
+}
+.msg.bot h1,
+.msg.bot h2,
+.msg.bot h3,
+.msg.bot h4,
+.msg.bot h5,
+.msg.bot h6 {
+  margin: 8px 0 4px;
+  font-size: 13.5px;
+  font-weight: 700;
+}
+.msg.bot ul,
+.msg.bot ol {
+  margin: 4px 0 6px;
+  padding-left: 18px;
+}
+.msg.bot li {
+  margin: 2px 0;
+}
+.msg.bot a {
+  color: var(--accent);
+}
+.msg.bot code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.msg.bot pre {
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  margin: 5px 0 6px;
+}
+.msg.bot pre code {
+  background: none;
+  padding: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.msg.bot blockquote {
+  border-left: 2px solid var(--line);
+  margin: 4px 0;
+  padding-left: 10px;
+  color: var(--muted);
+}
+.msg.bot hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 8px 0;
+}
+
+/* tool timeline */
+.tl {
+  position: relative;
+  padding-left: 15px;
+  margin: 6px 0 2px;
+}
+.tl::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.tl-head {
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.tl-name {
+  font-weight: 700;
+  color: var(--fg);
+}
+.tl-sub {
+  margin-left: 6px;
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  word-break: break-all;
+}
+.tl-io {
+  margin: 4px 0 0;
+  background: #0c0d12;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #cfd6e6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.tl-out {
+  color: #aeb6c6;
+}
+.tl-out.err {
+  color: var(--danger);
+  border-color: rgba(255, 107, 107, 0.4);
+}
+.msg-err {
+  color: var(--danger);
   margin-top: 4px;
+  font-size: 12.5px;
 }
 
 /* "Turbo is thinking" indicator */

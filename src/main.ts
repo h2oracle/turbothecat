@@ -18,6 +18,7 @@ import {
   type ChatEntry,
 } from "./backend";
 import * as fx from "./effects";
+import { renderMarkdown } from "./md";
 
 const appWindow = getCurrentWindow();
 // Roomy enough for the soft shadow AND the tail that sweeps over her head.
@@ -250,7 +251,8 @@ function selectTab(id: number) {
   const t = tabs.find((x) => x.id === id);
   if (t) {
     t.unread = false;
-    t.view.scrollTop = t.view.scrollHeight;
+    // defer so the now-visible view is laid out before we jump to the bottom
+    requestAnimationFrame(() => scrollToEnd(t.view));
   }
   tabs.forEach((x) => x.view.classList.toggle("hidden", x.id !== id));
   renderTabs();
@@ -787,6 +789,13 @@ appWindow.onFocusChanged(({ payload: focused }) => {
   if (!focused && isOpen() && performance.now() - lastPanelDown > 400) setOpen(false);
 });
 panel.addEventListener("mousedown", () => (lastPanelDown = performance.now()));
+// clicking the empty (transparent) area around the chat also minimizes it
+app.addEventListener("mousedown", (e) => {
+  if (!isOpen()) return;
+  const target = e.target as Node;
+  if (panel.contains(target) || mascot.contains(target)) return;
+  setOpen(false);
+});
 
 // ———————————————————— mascot: click to open, drag to move ————————————————————
 // Dragging collapses the chat to just the cat (so she moves freely with no
@@ -872,11 +881,100 @@ function addMsg(t: Tab, kind: "user" | "bot", text = ""): HTMLDivElement {
   const stick = kind === "user" || atBottom(t.view);
   const el = document.createElement("div");
   el.className = `msg ${kind}`;
-  el.textContent = text;
+  if (kind === "bot" && text) el.innerHTML = renderMarkdown(text); // rich replies
+  else el.textContent = text;
   t.body.appendChild(el);
   if (stick) scrollToEnd(t.view);
   if (t.id === activeId) updateToEnd();
   return el;
+}
+
+// ———————————————————— tool timeline (Claude-style) ————————————————————
+const baseName = (p: string) => p.split("/").filter(Boolean).pop() || p;
+
+// Map a tool call to a short label + descriptor (+ command code for Bash).
+function formatTool(name: string, input: Record<string, unknown> = {}): { label: string; sub: string; code: string } {
+  const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : "");
+  const num = (k: string) => (typeof input[k] === "number" ? (input[k] as number) : undefined);
+  switch (name) {
+    case "Bash":
+      return { label: "Bash", sub: str("description"), code: str("command") };
+    case "Read": {
+      const off = num("offset");
+      const lim = num("limit");
+      const lines = off && lim ? ` (lines ${off}–${off + lim - 1})` : lim ? ` (first ${lim} lines)` : "";
+      return { label: "Read", sub: baseName(str("file_path")) + lines, code: "" };
+    }
+    case "Edit":
+      return { label: "Edit", sub: baseName(str("file_path")), code: "" };
+    case "MultiEdit": {
+      const n = Array.isArray(input.edits) ? (input.edits as unknown[]).length : 0;
+      return { label: "Edit", sub: `${baseName(str("file_path"))}${n ? ` (${n} edits)` : ""}`, code: "" };
+    }
+    case "Write":
+      return { label: "Write", sub: baseName(str("file_path")), code: "" };
+    case "NotebookEdit":
+      return { label: "Edit", sub: baseName(str("notebook_path")), code: "" };
+    case "Grep":
+      return { label: "Grep", sub: `"${str("pattern")}"${str("path") ? ` in ${baseName(str("path"))}` : ""}`, code: "" };
+    case "Glob":
+      return { label: "Glob", sub: str("pattern"), code: "" };
+    case "LS":
+      return { label: "List", sub: baseName(str("path")) || str("path"), code: "" };
+    case "WebFetch":
+      return { label: "Fetch", sub: str("url"), code: "" };
+    case "WebSearch":
+      return { label: "Search", sub: str("query"), code: "" };
+    case "TodoWrite":
+      return { label: "Todos", sub: "updated", code: "" };
+    case "Task":
+      return { label: "Task", sub: str("description") || str("subagent_type"), code: "" };
+    default: {
+      for (const k of ["command", "file_path", "path", "pattern", "url", "query"]) {
+        if (str(k)) return { label: name, sub: str(k), code: "" };
+      }
+      return { label: name, sub: "", code: "" };
+    }
+  }
+}
+
+function buildToolRow(name: string, input: Record<string, unknown>): HTMLDivElement {
+  const f = formatTool(name, input);
+  const row = document.createElement("div");
+  row.className = "tl";
+  row.dataset.tool = name;
+  const head = document.createElement("div");
+  head.className = "tl-head";
+  const nm = document.createElement("span");
+  nm.className = "tl-name";
+  nm.textContent = f.label;
+  head.appendChild(nm);
+  if (f.sub) {
+    const sb = document.createElement("span");
+    sb.className = "tl-sub";
+    sb.textContent = f.sub;
+    head.appendChild(sb);
+  }
+  row.appendChild(head);
+  if (f.code) {
+    const pre = document.createElement("pre");
+    pre.className = "tl-io";
+    pre.textContent = f.code;
+    row.appendChild(pre);
+  }
+  return row;
+}
+
+// Attach a tool's output. Shown for Bash (and any error); other tools stay tidy.
+function fillToolResult(row: HTMLElement, ok: boolean, text: string) {
+  const show = !ok || row.dataset.tool === "Bash" || row.dataset.tool === "Grep";
+  if (!show || !text.trim()) return;
+  const lines = text.split("\n");
+  const clipped = lines.length > 12 ? lines.slice(0, 12).join("\n") + `\n… +${lines.length - 12} more lines` : text;
+  const pre = document.createElement("pre");
+  pre.className = "tl-io tl-out" + (ok ? "" : " err");
+  pre.textContent = clipped;
+  row.appendChild(pre);
 }
 
 async function runChat(t: Tab, text: string) {
@@ -887,16 +985,16 @@ async function runChat(t: Tab, text: string) {
   bot.classList.add("thinking");
   bot.innerHTML = `<span class="think-dots"><i></i><i></i><i></i></span>`;
   face.set("think");
-  // if Turbo is floating (collapsed), mirror the state in her speech bubble
-  const collapsed = !isOpen();
-  if (collapsed) showBubble("", { thinking: true });
+  if (!isOpen()) showBubble("", { thinking: true }); // mirror in her bubble if floating
   let first = true;
   let reply = "";
-  // clear the thinking placeholder the first time any content (text/tool) lands
+  let curText: HTMLDivElement | null = null; // current streamed-text block
+  let curSeg = "";
+  const rows = new Map<string, HTMLElement>(); // tool_use id → timeline row
   const clearThinking = () => {
     if (first) {
       bot.classList.remove("thinking");
-      bot.textContent = "";
+      bot.innerHTML = "";
       first = false;
     }
   };
@@ -913,27 +1011,45 @@ async function runChat(t: Tab, text: string) {
           face.set("talk");
         }
         reply += chunk;
-        bot.textContent = reply;
+        if (!curText) {
+          curText = document.createElement("div");
+          curText.className = "md";
+          curSeg = "";
+          bot.appendChild(curText);
+        }
+        curSeg += chunk;
+        curText.innerHTML = renderMarkdown(curSeg);
         if (stick) scrollToEnd(t.view);
         if (t.id === activeId) updateToEnd();
       },
-      onTool: (line) => {
+      onTool: (payload) => {
+        let ev: { kind: string; id: string; name?: string; input?: Record<string, unknown>; ok?: boolean; text?: string };
+        try {
+          ev = JSON.parse(payload);
+        } catch {
+          return;
+        }
         const stick = atBottom(t.view);
-        clearThinking();
-        const s = document.createElement("span");
-        s.className = "tool";
-        s.textContent = `⚙ ${line}`;
-        bot.appendChild(s);
+        if (ev.kind === "use") {
+          clearThinking();
+          curText = null; // text after a tool starts a fresh block below it
+          const row = buildToolRow(ev.name || "tool", ev.input || {});
+          bot.appendChild(row);
+          rows.set(ev.id, row);
+        } else if (ev.kind === "result") {
+          const row = rows.get(ev.id);
+          if (row) fillToolResult(row, ev.ok !== false, ev.text || "");
+        }
         if (stick) scrollToEnd(t.view);
         if (t.id === activeId) updateToEnd();
       },
       onDone: (result) => {
         face.set("idle");
         t.busy = false;
-        // a turn that produced nothing visible: drop the empty thinking bubble
+        // a turn that produced nothing visible: drop the empty bubble
         if (first) {
           clearThinking();
-          if (!reply.trim()) bot.remove();
+          if (!bot.childNodes.length) bot.remove();
         }
         if (result?.sessionId) t.sessionId = result.sessionId; // remember for next turn
         t.syncCount = undefined; // re-baseline against the log so we don't echo our own turn
@@ -943,8 +1059,8 @@ async function runChat(t: Tab, text: string) {
         voiceTurn = false;
         refreshUsage();
         saveState();
-        // show the gist in the bubble if she's still floating
-        if (collapsed && !isOpen()) {
+        // show the gist in her bubble if the panel is closed (incl. minimized mid-turn)
+        if (!isOpen()) {
           const txt = shortText(reply);
           if (txt) showBubble(txt, { hold: 6500 });
           else hideBubble();
@@ -952,14 +1068,16 @@ async function runChat(t: Tab, text: string) {
       },
       onError: (msg) => {
         clearThinking();
-        bot.classList.add("error");
-        bot.textContent = msg || "Something went wrong.";
+        const err = document.createElement("div");
+        err.className = "msg-err";
+        err.textContent = msg || "Something went wrong.";
+        bot.appendChild(err);
         face.set("error");
         t.busy = false;
         voiceTurn = false;
         setTimeout(() => face.set("idle"), 2600);
         saveState();
-        if (collapsed && !isOpen()) showBubble(shortText(msg) || "Something went wrong.", { hold: 5000 });
+        if (!isOpen()) showBubble(shortText(msg) || "Something went wrong.", { hold: 5000 });
       },
     },
   );
@@ -1070,7 +1188,8 @@ async function reloadSession(s: SessionInfo) {
   if (!entries.length) addMsg(t, "bot", "(couldn't load this chat's messages, but I can still continue it)");
   for (const e of entries) addMsg(t, e.role, e.text);
   t.syncCount = entries.length; // baseline for live sync
-  t.view.scrollTop = t.view.scrollHeight;
+  // jump to the latest message once the layout has flushed
+  requestAnimationFrame(() => requestAnimationFrame(() => scrollToEnd(t.view)));
   saveState();
 }
 
