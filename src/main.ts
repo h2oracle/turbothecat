@@ -1,8 +1,5 @@
 import "./styles.css";
 import { getCurrentWindow, currentMonitor, LogicalSize, LogicalPosition } from "@tauri-apps/api/window";
-
-// startResizeDragging takes one of these direction strings.
-type ResizeDir = "East" | "South" | "SouthEast";
 import { CatFace } from "./face";
 import {
   ask,
@@ -23,7 +20,8 @@ import {
 import * as fx from "./effects";
 
 const appWindow = getCurrentWindow();
-const COLLAPSE = { w: 100, h: 100 };
+// Roomy enough for the soft shadow AND the tail that sweeps over her head.
+const COLLAPSE = { w: 150, h: 150 };
 // Discrete open sizes the user can step through (S / M / L / XL).
 const SIZES = [
   { w: 460, h: 420 },
@@ -41,12 +39,14 @@ try {
 } catch {
   customSize = null;
 }
-// True while we resize the window ourselves, so onResized ignores our own changes.
-let programmatic = false;
+// Where the cat was floating before we opened, so we can return there on close.
+let preOpen: { x: number; y: number } | null = null;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = /* html */ `
   <div class="mascot" id="mascot" title="Click to chat · drag to move"></div>
+
+  <div class="bubble" id="bubble"><span class="bubble-content" id="bubbleContent"></span></div>
 
   <div class="panel" id="panel">
     <div class="header">
@@ -97,6 +97,15 @@ app.innerHTML = /* html */ `
 
 const mascot = document.querySelector<HTMLDivElement>("#mascot")!;
 const face = new CatFace(mascot);
+
+// A tiny wagging tail poking out of the top-right of the circle. Appended after
+// CatFace (which owns the mascot's inner SVG) so it isn't overwritten.
+const tail = document.createElement("div");
+tail.className = "tail";
+tail.innerHTML = /* html */ `<svg viewBox="0 0 24 36" xmlns="http://www.w3.org/2000/svg">
+  <path d="M9 36 C 6 28 7 18 11 12 C 14 8 17 7 16 4 C 20 6 20 12 17 17 C 14 22 14 30 15 36 Z" fill="#0a0a0c"/>
+</svg>`;
+mascot.appendChild(tail);
 const input = document.querySelector<HTMLInputElement>("#prompt")!;
 const panel = document.querySelector<HTMLDivElement>("#panel")!;
 const tabbar = document.querySelector<HTMLDivElement>("#tabbar")!;
@@ -115,6 +124,8 @@ const wcSmaller = document.querySelector<HTMLButtonElement>("#wcSmaller")!;
 const wcBigger = document.querySelector<HTMLButtonElement>("#wcBigger")!;
 const wcFull = document.querySelector<HTMLButtonElement>("#wcFull")!;
 const toEndBtn = document.querySelector<HTMLButtonElement>("#toEnd")!;
+const bubble = document.querySelector<HTMLDivElement>("#bubble")!;
+const bubbleContent = document.querySelector<HTMLSpanElement>("#bubbleContent")!;
 
 // Whether a scroll container is parked at (or near) its bottom.
 const NEAR_BOTTOM = 80;
@@ -144,8 +155,8 @@ for (const sel of [backendSel, permSel, modelSel]) {
 
 let homePath = "/";
 let voiceTurn = false;
-let curW = COLLAPSE.w;
 let lastPanelDown = 0;
+let lastInteract = 0; // last time the user touched the cat (to time idle quips)
 
 const shortCwd = (p: string) => (homePath && p.startsWith(homePath) ? p.replace(homePath, "~") : p);
 
@@ -346,25 +357,199 @@ async function targetDims() {
   return { w: base.w, h: base.h, full: false, x: 0, y: 0 };
 }
 
-// Resize/move the OS window, keeping it horizontally centred on its current
-// position (or pinned to the monitor origin when full-screen).
-async function moveResize(w: number, h: number, full = false, x = 0, y = 0) {
-  programmatic = true;
+// Set window size + position directly (logical px), guarding our own events.
+async function place(w: number, h: number, x: number, y: number) {
   try {
-    const scale = await appWindow.scaleFactor();
-    const pos = await appWindow.outerPosition();
     await appWindow.setSize(new LogicalSize(w, h));
-    if (full) {
-      await appWindow.setPosition(new LogicalPosition(x, y));
-    } else {
-      const centerX = pos.x / scale + curW / 2;
-      await appWindow.setPosition(new LogicalPosition(Math.max(0, centerX - w / 2), pos.y / scale));
-    }
-    curW = w;
+    await appWindow.setPosition(new LogicalPosition(Math.round(x), Math.round(y)));
   } catch {
     /* not in tauri */
   }
-  setTimeout(() => (programmatic = false), 150);
+}
+
+// Position an absolutely-placed element within the window.
+function setBox(el: HTMLElement, x: number, y: number, w?: number, h?: number) {
+  el.style.left = `${Math.round(x)}px`;
+  el.style.top = `${Math.round(y)}px`;
+  if (w != null) el.style.width = `${Math.round(w)}px`;
+  if (h != null) el.style.height = `${Math.round(h)}px`;
+}
+
+const clampv = (v: number, a: number, b: number) => (b < a ? a : Math.max(a, Math.min(v, b)));
+const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+type Bounds = { x: number; y: number; w: number; h: number };
+// The monitor's *work area* (excludes the menu bar / Dock / taskbar) so the chat
+// never tucks behind them.
+async function monBounds(): Promise<Bounds> {
+  try {
+    const mon = await currentMonitor();
+    if (mon) {
+      const s = mon.scaleFactor;
+      const wa = mon.workArea;
+      return { x: wa.position.x / s, y: wa.position.y / s, w: wa.size.width / s, h: wa.size.height / s };
+    }
+  } catch {
+    /* not in tauri */
+  }
+  return { x: 0, y: 0, w: 1920, h: 1200 };
+}
+
+// Cat geometry.
+const CAT_W = 92;
+const CAT_H = 92;
+const CAT_TOP_OFF = 34; // cat top within the collapsed window (leaves room for tail)
+const CAT_LEFT_OFF = (COLLAPSE.w - CAT_W) / 2; // cat left within the collapsed window
+// Extra space the wagging tail needs above / beside the cat, so it isn't clipped.
+const HALO_T = 30;
+const HALO_S = 26;
+type Anchor = { catTop: number; catCenterX: number };
+type Side = "below" | "above" | "right" | "left";
+
+// Place the panel on one side of the (fixed) cat, sliding it along the cross-axis
+// to stay on screen. Returns the window rect + element offsets within it.
+function computeLayout(anchor: Anchor, side: Side, pw: number, ph: number, mon: Bounds, OM: number, G: number) {
+  const catLeft = anchor.catCenterX - CAT_W / 2;
+  const catTop = anchor.catTop;
+  const catRight = catLeft + CAT_W;
+  const catBottom = catTop + CAT_H;
+  let pLeft: number;
+  let pTop: number;
+  if (side === "below") {
+    pTop = catBottom + G;
+    pLeft = clampv(anchor.catCenterX - pw / 2, mon.x + OM, mon.x + mon.w - OM - pw);
+  } else if (side === "above") {
+    pTop = catTop - G - ph;
+    pLeft = clampv(anchor.catCenterX - pw / 2, mon.x + OM, mon.x + mon.w - OM - pw);
+  } else if (side === "right") {
+    pLeft = catRight + G;
+    pTop = clampv(catTop + CAT_H / 2 - ph / 2, mon.y + OM, mon.y + mon.h - OM - ph);
+  } else {
+    pLeft = catLeft - G - pw;
+    pTop = clampv(catTop + CAT_H / 2 - ph / 2, mon.y + OM, mon.y + mon.h - OM - ph);
+  }
+  // include the tail's halo (above + sides of the cat) so it's never clipped
+  const x0 = Math.min(catLeft - HALO_S, pLeft) - OM;
+  const y0 = Math.min(catTop - HALO_T, pTop) - OM;
+  const x1 = Math.max(catRight + HALO_S, pLeft + pw) + OM;
+  const y1 = Math.max(catBottom, pTop + ph) + OM;
+  return {
+    winLeft: x0,
+    winTop: y0,
+    winW: x1 - x0,
+    winH: y1 - y0,
+    catX: catLeft - x0,
+    catY: catTop - y0,
+    pX: pLeft - x0,
+    pY: pTop - y0,
+  };
+}
+
+// The cat's current on-screen anchor, read from the live window + mascot offset.
+async function currentCatAnchorOpen(): Promise<Anchor> {
+  const scale = await appWindow.scaleFactor();
+  const pos = await appWindow.outerPosition();
+  const catX = parseFloat(mascot.style.left) || 0;
+  const catY = parseFloat(mascot.style.top) || 0;
+  return { catTop: pos.y / scale + catY, catCenterX: pos.x / scale + catX + CAT_W / 2 };
+}
+
+// Same, but for the collapsed cat (falls back to CSS defaults if no inline yet).
+async function collapsedAnchor(): Promise<Anchor> {
+  const scale = await appWindow.scaleFactor();
+  const pos = await appWindow.outerPosition();
+  const catX = parseFloat(mascot.style.left) || CAT_LEFT_OFF;
+  const catY = parseFloat(mascot.style.top) || CAT_TOP_OFF;
+  return { catTop: pos.y / scale + catY, catCenterX: pos.x / scale + catX + CAT_W / 2 };
+}
+
+function layoutCollapsed(winW: number) {
+  setBox(mascot, (winW - CAT_W) / 2, CAT_TOP_OFF);
+}
+
+// Open the chat on whichever side of the cat has the most room, keeping the cat
+// anchored where she floats so the whole window stays on screen.
+async function applyOpen(anchor: Anchor) {
+  try {
+    const d = await targetDims();
+    const mon = await monBounds();
+    const OM = 14;
+    const G = 10;
+    const MINW = 300;
+    const MINH = 200;
+
+    if (d.full) {
+      await place(d.w, d.h, d.x, d.y);
+      setBox(mascot, (d.w - CAT_W) / 2, OM);
+      setBox(panel, OM, OM + CAT_H + G, d.w - 2 * OM, d.h - (OM + CAT_H + G) - OM);
+      return;
+    }
+
+    const catLeft = anchor.catCenterX - CAT_W / 2;
+    const catTop = anchor.catTop;
+    const catRight = catLeft + CAT_W;
+    const catBottom = catTop + CAT_H;
+    const PW = d.w;
+    const PH = d.h;
+    const fullW = mon.w - 2 * OM;
+    const fullH = mon.h - 2 * OM;
+
+    const spaceBelow = mon.y + mon.h - OM - (catBottom + G);
+    const spaceAbove = catTop - G - (mon.y + OM);
+    const spaceRight = mon.x + mon.w - OM - (catRight + G);
+    const spaceLeft = catLeft - G - (mon.x + OM);
+
+    type Cand = { side: Side; pw: number; ph: number; score: number };
+    const cands: Cand[] = [];
+    if (spaceBelow >= MINH) {
+      const pw = Math.min(PW, fullW);
+      const ph = Math.min(PH, spaceBelow);
+      cands.push({ side: "below", pw, ph, score: pw * ph * 1.15 }); // prefer below
+    }
+    if (spaceAbove >= MINH) {
+      const pw = Math.min(PW, fullW);
+      const ph = Math.min(PH, spaceAbove);
+      cands.push({ side: "above", pw, ph, score: pw * ph });
+    }
+    if (spaceRight >= MINW) {
+      const pw = Math.min(PW, spaceRight);
+      const ph = Math.min(PH, fullH);
+      cands.push({ side: "right", pw, ph, score: pw * ph * 1.05 });
+    }
+    if (spaceLeft >= MINW) {
+      const pw = Math.min(PW, spaceLeft);
+      const ph = Math.min(PH, fullH);
+      cands.push({ side: "left", pw, ph, score: pw * ph });
+    }
+
+    let best = cands.sort((a, b) => b.score - a.score)[0];
+    if (!best) {
+      // nothing fits cleanly — fall back to below, clamped to the screen
+      best = { side: "below", pw: Math.min(Math.max(MINW, PW), fullW), ph: Math.min(Math.max(MINH, PH), fullH), score: 0 };
+    }
+
+    const L = computeLayout(anchor, best.side, best.pw, best.ph, mon, OM, G);
+    await place(L.winW, L.winH, L.winLeft, L.winTop);
+    setBox(mascot, L.catX, L.catY);
+    setBox(panel, L.pX, L.pY, best.pw, best.ph);
+  } catch {
+    /* not in tauri */
+  }
+}
+
+// Collapse back to the floating cat, returning to where it was before opening.
+async function collapseWindow() {
+  try {
+    const scale = await appWindow.scaleFactor();
+    const pos = await appWindow.outerPosition();
+    const x = preOpen ? preOpen.x : pos.x / scale;
+    const y = preOpen ? preOpen.y : pos.y / scale;
+    await place(COLLAPSE.w, COLLAPSE.h, Math.max(0, x), Math.max(0, y));
+    layoutCollapsed(COLLAPSE.w);
+  } catch {
+    /* not in tauri */
+  }
+  preOpen = null;
 }
 
 async function setOpen(open: boolean) {
@@ -372,16 +557,101 @@ async function setOpen(open: boolean) {
   panel.classList.toggle("open", open);
   mascot.classList.toggle("open", open);
   if (open) {
-    const d = await targetDims();
-    await moveResize(d.w, d.h, d.full, d.x, d.y);
-  } else {
-    await moveResize(COLLAPSE.w, COLLAPSE.h);
-  }
-  if (open) {
+    await hideBubble(); // collapse any bubble first
+    let anchor: Anchor = { catTop: 0, catCenterX: 0 };
+    try {
+      anchor = await collapsedAnchor();
+      // collapsed-equivalent window top-left, for returning here on close
+      preOpen = { x: anchor.catCenterX - COLLAPSE.w / 2, y: anchor.catTop - CAT_TOP_OFF };
+    } catch {
+      preOpen = null;
+    }
+    await applyOpen(anchor);
+    lastInteract = performance.now();
     face.greet();
     fx.hearts(7);
     setTimeout(() => input.focus(), 60);
+  } else {
+    await collapseWindow();
   }
+}
+
+// ———————————————————— speech bubble (collapsed feedback) ————————————————————
+// While Turbo is floating (panel closed) she shows what she's doing in a little
+// speech bubble under her: a thinking animation, or a short statement.
+const THINK_BUBBLE = `<span class="think-dots"><i></i><i></i><i></i></span>`;
+let bubbleTimer: number | undefined;
+let bubbleMode = ""; // dedupe so streaming voice partials don't keep resizing
+
+async function showBubble(html: string, opts: { thinking?: boolean; hold?: number } = {}) {
+  const mode = opts.thinking ? "think" : "say:" + html;
+  clearTimeout(bubbleTimer);
+  if (!(bubble.classList.contains("show") && bubbleMode === mode)) {
+    bubbleMode = mode;
+    bubbleContent.innerHTML = opts.thinking ? THINK_BUBBLE : html;
+    bubble.classList.add("show");
+    if (!isOpen()) await fitBubble();
+  }
+  if (opts.hold) bubbleTimer = window.setTimeout(hideBubble, opts.hold);
+}
+
+async function hideBubble() {
+  clearTimeout(bubbleTimer);
+  bubbleMode = "";
+  if (!bubble.classList.contains("show")) return;
+  bubble.classList.remove("show");
+  if (!isOpen()) {
+    try {
+      const a = await collapsedAnchor();
+      await place(COLLAPSE.w, COLLAPSE.h, a.catCenterX - COLLAPSE.w / 2, a.catTop - CAT_TOP_OFF);
+      layoutCollapsed(COLLAPSE.w);
+    } catch {
+      /* not in tauri */
+    }
+  }
+}
+
+// Grow the floating window to hold the cat + a speech bubble below her, keeping
+// the cat anchored. Measure the bubble at a comfortable width first.
+async function fitBubble() {
+  const anchor = await collapsedAnchor();
+  const mon = await monBounds();
+  try {
+    await appWindow.setSize(new LogicalSize(320, 320));
+  } catch {
+    /* not in tauri */
+  }
+  await raf();
+  const bw = Math.min(Math.ceil(bubble.offsetWidth) || 200, 260);
+  const bh = Math.ceil(bubble.offsetHeight) || 44;
+  const L = computeLayout(anchor, "below", bw, bh, mon, 12, 8);
+  await place(L.winW, L.winH, L.winLeft, L.winTop);
+  setBox(mascot, L.catX, L.catY);
+  setBox(bubble, L.pX, L.pY, bw, bh);
+}
+
+// Trim a reply down to something that fits in a small bubble.
+function shortText(s: string): string {
+  const clean = s.replace(/\s+/g, " ").trim();
+  return clean.length > 140 ? clean.slice(0, 138).trimEnd() + "…" : clean;
+}
+
+// Tap the bubble to open the full chat.
+bubble.addEventListener("click", () => setOpen(true));
+
+// Little things Turbo says from her bubble while floating, so she feels alive.
+const QUIPS = [
+  "meow — tap me to chat 🐾",
+  "need a hand with some code?",
+  "purr… ready when you are",
+  "what are we building?",
+  "drag me anywhere you like",
+  "got a bug? point me at it 🐱",
+];
+function maybeQuip() {
+  if (isOpen() || document.hidden) return;
+  if (performance.now() - lastInteract < 25_000) return; // don't interrupt activity
+  showBubble(QUIPS[Math.floor(Math.random() * QUIPS.length)], { hold: 4500 });
 }
 
 // Re-apply the current size/fullscreen state to the live window (opening first
@@ -390,8 +660,7 @@ async function reapplySize() {
   if (!isOpen()) {
     await setOpen(true);
   } else {
-    const d = await targetDims();
-    await moveResize(d.w, d.h, d.full, d.x, d.y);
+    await applyOpen(await currentCatAnchorOpen());
   }
   updateWinCtrls();
 }
@@ -447,40 +716,56 @@ wcSmaller.addEventListener("click", () => changeSize(-1));
 wcBigger.addEventListener("click", () => changeSize(1));
 wcFull.addEventListener("click", () => toggleFullscreen());
 
-// Drag handles on the right / bottom / corner edges → native window resize.
+// Drag the right / bottom / corner of the panel to resize it live. The panel is
+// a fixed-size element now, so we adjust the desired size and re-lay-out.
 const rzE = document.querySelector<HTMLDivElement>("#rzE")!;
 const rzS = document.querySelector<HTMLDivElement>("#rzS")!;
 const rzSE = document.querySelector<HTMLDivElement>("#rzSE")!;
-function startResize(dir: ResizeDir) {
+let relayoutQueued = false;
+function scheduleRelayout() {
+  if (relayoutQueued) return;
+  relayoutQueued = true;
+  requestAnimationFrame(async () => {
+    relayoutQueued = false;
+    if (isOpen()) await applyOpen(await currentCatAnchorOpen());
+  });
+}
+function startResize(dir: "E" | "S" | "SE") {
   return (e: MouseEvent) => {
     if (e.button !== 0) return;
     e.preventDefault();
-    lastPanelDown = performance.now(); // don't auto-close on the focus blip
+    lastPanelDown = performance.now();
     fullscreen = false;
     localStorage.setItem("turbo.fs", "0");
-    appWindow.startResizeDragging(dir).catch(() => {});
+    const sx = e.screenX;
+    const sy = e.screenY;
+    const sw = panel.offsetWidth;
+    const sh = panel.offsetHeight;
+    const onMove = (m: MouseEvent) => {
+      let w = sw;
+      let h = sh;
+      if (dir === "E" || dir === "SE") w = sw + (m.screenX - sx);
+      if (dir === "S" || dir === "SE") h = sh + (m.screenY - sy);
+      customSize = {
+        w: Math.max(280, Math.min(Math.round(w), 2200)),
+        h: Math.max(200, Math.min(Math.round(h), 1700)),
+      };
+      scheduleRelayout();
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (customSize) localStorage.setItem("turbo.custom", JSON.stringify(customSize));
+      updateWinCtrls();
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   };
 }
-rzE.addEventListener("mousedown", startResize("East"));
-rzS.addEventListener("mousedown", startResize("South"));
-rzSE.addEventListener("mousedown", startResize("SouthEast"));
+rzE.addEventListener("mousedown", startResize("E"));
+rzS.addEventListener("mousedown", startResize("S"));
+rzSE.addEventListener("mousedown", startResize("SE"));
 
-// Remember a hand-dragged size so it restores next time the panel opens.
-appWindow.onResized(async ({ payload }) => {
-  if (programmatic || fullscreen || !isOpen()) return;
-  try {
-    const scale = await appWindow.scaleFactor();
-    const w = payload.width / scale;
-    const h = payload.height / scale;
-    if (w < 220 || h < 160) return; // ignore collapse / spurious events
-    customSize = { w, h };
-    curW = w;
-    localStorage.setItem("turbo.custom", JSON.stringify(customSize));
-    updateWinCtrls();
-  } catch {
-    /* not in tauri */
-  }
-});
 
 // ⌘/Ctrl +  −  0  to grow / shrink / reset the window.
 window.addEventListener("keydown", (e) => {
@@ -504,24 +789,80 @@ appWindow.onFocusChanged(({ payload: focused }) => {
 panel.addEventListener("mousedown", () => (lastPanelDown = performance.now()));
 
 // ———————————————————— mascot: click to open, drag to move ————————————————————
+// Dragging collapses the chat to just the cat (so she moves freely with no
+// constraints), follows the cursor manually, and reopens the chat — recalculated
+// for her new spot — when you let go. A click without movement toggles the chat.
 let down: { x: number; y: number } | null = null;
 let moved = false;
+let openAtDragStart = false;
+let dragOff: { x: number; y: number } | null = null;
+let monTopLimit = -Infinity;
+
 mascot.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
   down = { x: e.screenX, y: e.screenY };
   moved = false;
+  openAtDragStart = isOpen();
+  dragOff = null;
+  lastInteract = performance.now();
 });
-window.addEventListener("mousemove", (e) => {
+
+window.addEventListener("mousemove", async (e) => {
   if (!down) return;
-  if (!moved && Math.hypot(e.screenX - down.x, e.screenY - down.y) > 4) {
+  if (!moved) {
+    if (Math.hypot(e.screenX - down.x, e.screenY - down.y) <= 4) return;
     moved = true;
-    down = null;
-    appWindow.startDragging().catch(() => {});
+    lastPanelDown = performance.now();
+    // collapse to just the cat, keeping her under the cursor
+    if (openAtDragStart) {
+      try {
+        const a = await currentCatAnchorOpen();
+        panel.classList.remove("open");
+        mascot.classList.remove("open");
+        await place(COLLAPSE.w, COLLAPSE.h, a.catCenterX - COLLAPSE.w / 2, a.catTop - CAT_TOP_OFF);
+        layoutCollapsed(COLLAPSE.w);
+      } catch {
+        /* not in tauri */
+      }
+    }
+    // cursor offset within the (collapsed) window, + top limit so she stays visible
+    try {
+      const scale = await appWindow.scaleFactor();
+      const pos = await appWindow.outerPosition();
+      dragOff = { x: e.screenX - pos.x / scale, y: e.screenY - pos.y / scale };
+      const mon = await monBounds();
+      monTopLimit = mon.y;
+    } catch {
+      dragOff = { x: e.screenX, y: e.screenY };
+      monTopLimit = -Infinity;
+    }
   }
+  if (!dragOff) return;
+  const x = e.screenX - dragOff.x;
+  const y = Math.max(monTopLimit, e.screenY - dragOff.y);
+  appWindow.setPosition(new LogicalPosition(Math.round(x), Math.round(y))).catch(() => {});
 });
-window.addEventListener("mouseup", () => {
-  if (down && !moved) setOpen(!isOpen());
+
+window.addEventListener("mouseup", async () => {
+  const wasClick = down && !moved;
+  const wasDrag = down && moved;
   down = null;
+  if (wasClick) {
+    setOpen(!isOpen());
+    return;
+  }
+  if (wasDrag) {
+    dragOff = null;
+    // record where she landed, then reopen the chat there if it was open
+    try {
+      const scale = await appWindow.scaleFactor();
+      const pos = await appWindow.outerPosition();
+      preOpen = { x: pos.x / scale, y: pos.y / scale };
+    } catch {
+      /* not in tauri */
+    }
+    if (openAtDragStart) await setOpen(true);
+  }
 });
 
 // ———————————————————— chat ————————————————————
@@ -546,6 +887,9 @@ async function runChat(t: Tab, text: string) {
   bot.classList.add("thinking");
   bot.innerHTML = `<span class="think-dots"><i></i><i></i><i></i></span>`;
   face.set("think");
+  // if Turbo is floating (collapsed), mirror the state in her speech bubble
+  const collapsed = !isOpen();
+  if (collapsed) showBubble("", { thinking: true });
   let first = true;
   let reply = "";
   // clear the thinking placeholder the first time any content (text/tool) lands
@@ -599,6 +943,12 @@ async function runChat(t: Tab, text: string) {
         voiceTurn = false;
         refreshUsage();
         saveState();
+        // show the gist in the bubble if she's still floating
+        if (collapsed && !isOpen()) {
+          const txt = shortText(reply);
+          if (txt) showBubble(txt, { hold: 6500 });
+          else hideBubble();
+        }
       },
       onError: (msg) => {
         clearThinking();
@@ -609,6 +959,7 @@ async function runChat(t: Tab, text: string) {
         voiceTurn = false;
         setTimeout(() => face.set("idle"), 2600);
         saveState();
+        if (collapsed && !isOpen()) showBubble(shortText(msg) || "Something went wrong.", { hold: 5000 });
       },
     },
   );
@@ -922,12 +1273,13 @@ const WAKE = /(?:hey |hi |ok |hey,? )?turbo\b[\s,.:!?-]*(.*)/i;
 function onVoicePartial(text: string) {
   if (!voiceOn) return;
   voicePartial = text;
-  setOpen(true);
   const m = text.match(WAKE);
-  // Live dictation: show the command (after the wake word) or the raw words so
-  // you can see Turbo is hearing you. Auto-submits only when the wake word fired.
-  input.value = m ? (m[1] || "").trim() : text.trim();
-  if (m) face.set("think");
+  if (m) {
+    // heard the wake word — show we're listening (bubble if floating, input if open)
+    face.set("think");
+    if (isOpen()) input.value = (m[1] || "").trim();
+    else showBubble("", { thinking: true });
+  }
   clearTimeout(voiceSilence);
   voiceSilence = window.setTimeout(finalizeVoice, 1100);
 }
@@ -948,11 +1300,17 @@ function finalizeVoice() {
   const cmd = (m?.[1] || "").trim();
   if (cmd.length > 1) {
     voiceTurn = true;
-    setOpen(true);
-    input.value = cmd;
-    submit();
+    const t = tabs.find((x) => x.type === "chat") ?? createTab("chat");
+    if (t.busy) return;
+    // Stay floating and answer in the bubble; if already open, run in the panel.
+    if (isOpen()) {
+      selectTab(t.id);
+      input.value = "";
+    }
+    runChat(t, cmd);
   } else {
     face.set("idle");
+    if (!isOpen()) hideBubble();
   }
 }
 
@@ -1072,11 +1430,17 @@ usageEl.addEventListener("click", (e) => {
   }
   if (!loadState()) createTab("chat");
   updateWinCtrls();
+  layoutCollapsed(COLLAPSE.w); // centre the floating cat
   // restored chats should open scrolled to the latest message
   for (const t of tabs) t.view.scrollTop = t.view.scrollHeight;
   refreshUsage();
   setInterval(refreshUsage, 30_000);
   setInterval(pollSessions, 3_000);
+  // a greeting bubble so you can see her speak, then occasional idle quips
+  setTimeout(() => {
+    if (!isOpen()) showBubble("hi, I'm Turbo 🐱 — tap me to chat", { hold: 5000 });
+  }, 1400);
+  setInterval(maybeQuip, 45_000);
   // Resume "Hey Turbo" listening if it was enabled last session.
   if (localStorage.getItem("turbo.voice") === "1") toggleVoice();
 })();
