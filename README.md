@@ -32,7 +32,9 @@ session logs (`~/.claude/projects/**/*.jsonl`) — the same data `ccusage` reads
 - 💬 **Chat** tab — ask Claude or Codex anything; replies stream in and drive the talking mouth
 - ⌨️ **Terminal** tab — a real streaming shell (runs through your login shell, `cd` sticks between commands)
 - ⚙️ Claude-style **settings footer** — permission mode (Ask / Auto-accept / Plan / Bypass), model/effort (Opus / Sonnet / Haiku), backend switch
-- ⌨️ **Slash commands** — type `/` for `/chat`, `/terminal`, `/clear`, `/cwd`, `/voice`, `/help`
+- ↔️ **Resizable** — step through preset sizes, toggle full screen, or drag the right/bottom/corner edges to make it as wide as you like (⌘ + / − / 0 too)
+- 🔄 **Live sync** — open chats follow the underlying session, so messages added from another window or the `claude` CLI show up automatically (with an unread dot on inactive tabs)
+- ⌨️ **Slash commands** — type `/` to see them all: `/chat`, `/terminal`, `/history`, `/clear`, `/cwd`, `/voice`, `/bigger`, `/smaller`, `/fullscreen`, `/persona`, `/help` …
 - 🎙️ **"Hey Turbo" voice** — wake-word listening; if you ask by voice, Turbo answers out loud (system TTS)
 - 📊 Live **burn meter** showing today's estimated spend from your Claude logs
 

@@ -1,5 +1,8 @@
 import "./styles.css";
-import { getCurrentWindow, LogicalSize, LogicalPosition } from "@tauri-apps/api/window";
+import { getCurrentWindow, currentMonitor, LogicalSize, LogicalPosition } from "@tauri-apps/api/window";
+
+// startResizeDragging takes one of these direction strings.
+type ResizeDir = "East" | "South" | "SouthEast";
 import { CatFace } from "./face";
 import {
   ask,
@@ -21,15 +24,45 @@ import * as fx from "./effects";
 
 const appWindow = getCurrentWindow();
 const COLLAPSE = { w: 100, h: 100 };
-const OPEN = { w: 620, h: 560 };
+// Discrete open sizes the user can step through (S / M / L / XL).
+const SIZES = [
+  { w: 460, h: 420 },
+  { w: 620, h: 560 },
+  { w: 820, h: 720 },
+  { w: 1040, h: 880 },
+];
+const clampIdx = (n: number) => Math.max(0, Math.min(SIZES.length - 1, n));
+let sizeIdx = clampIdx(parseInt(localStorage.getItem("turbo.size") ?? "1", 10) || 1);
+let fullscreen = localStorage.getItem("turbo.fs") === "1";
+// A free-form size from dragging the resize handles; overrides the preset when set.
+let customSize: { w: number; h: number } | null = null;
+try {
+  customSize = JSON.parse(localStorage.getItem("turbo.custom") || "null");
+} catch {
+  customSize = null;
+}
+// True while we resize the window ourselves, so onResized ignores our own changes.
+let programmatic = false;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = /* html */ `
   <div class="mascot" id="mascot" title="Click to chat · drag to move"></div>
 
   <div class="panel" id="panel">
-    <div class="tabbar" id="tabbar"></div>
-    <div class="views" id="views"></div>
+    <div class="header">
+      <div class="tabbar" id="tabbar"></div>
+      <div class="winctrls" id="winctrls">
+        <button class="wc" id="wcSmaller" title="Smaller (⌘−)">−</button>
+        <button class="wc" id="wcBigger" title="Bigger (⌘+)">+</button>
+        <button class="wc" id="wcFull" title="Full screen">⤢</button>
+      </div>
+    </div>
+    <div class="views" id="views">
+      <button class="toend" id="toEnd" title="Jump to latest">↓</button>
+    </div>
+    <div class="rz rz-e" id="rzE" title="Drag to resize"></div>
+    <div class="rz rz-s" id="rzS" title="Drag to resize"></div>
+    <div class="rz rz-se" id="rzSE" title="Drag to resize"></div>
     <div class="composer" id="composer">
       <span class="cwd" id="cwd"></span>
       <input class="prompt" id="prompt" placeholder="Ask Turbo anything…" autocomplete="off" spellcheck="false" />
@@ -78,6 +111,28 @@ const tabmenu = document.querySelector<HTMLDivElement>("#tabmenu")!;
 const backendSel = document.querySelector<HTMLSelectElement>("#backend")!;
 const permSel = document.querySelector<HTMLSelectElement>("#perm")!;
 const modelSel = document.querySelector<HTMLSelectElement>("#model")!;
+const wcSmaller = document.querySelector<HTMLButtonElement>("#wcSmaller")!;
+const wcBigger = document.querySelector<HTMLButtonElement>("#wcBigger")!;
+const wcFull = document.querySelector<HTMLButtonElement>("#wcFull")!;
+const toEndBtn = document.querySelector<HTMLButtonElement>("#toEnd")!;
+
+// Whether a scroll container is parked at (or near) its bottom.
+const NEAR_BOTTOM = 80;
+const atBottom = (v: HTMLElement) => v.scrollHeight - v.scrollTop - v.clientHeight < NEAR_BOTTOM;
+const scrollToEnd = (v: HTMLElement) => (v.scrollTop = v.scrollHeight);
+
+// Show the "jump to latest" arrow when the active view is scrolled up.
+function updateToEnd() {
+  const t = tabs.find((x) => x.id === activeId);
+  toEndBtn.classList.toggle("show", !!t && t.type !== "history" && !atBottom(t.view));
+}
+toEndBtn.addEventListener("click", () => {
+  const t = tabs.find((x) => x.id === activeId);
+  if (t) {
+    scrollToEnd(t.view);
+    updateToEnd();
+  }
+});
 
 // Persist the AI settings (backend / permission mode / model) across sessions.
 for (const sel of [backendSel, permSel, modelSel]) {
@@ -105,6 +160,8 @@ interface Tab {
   cwd: string;
   busy: boolean;
   sessionId?: string; // Claude session to resume (chat tabs)
+  syncCount?: number; // session entries already shown (for live cross-window sync)
+  unread?: boolean; // external messages arrived while this tab was inactive
 }
 interface RestoreTab {
   type: TabType;
@@ -134,6 +191,9 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
   const title = restore?.title ?? defaultTitle;
   const view = document.createElement("div");
   view.className = "view";
+  view.addEventListener("scroll", () => {
+    if (id === activeId) updateToEnd();
+  });
   const body = document.createElement("div");
   body.className = type === "terminal" ? "term" : type === "history" ? "history" : "log";
   view.appendChild(body);
@@ -176,9 +236,15 @@ function closeTab(id: number) {
 
 function selectTab(id: number) {
   activeId = id;
-  tabs.forEach((t) => t.view.classList.toggle("hidden", t.id !== id));
+  const t = tabs.find((x) => x.id === id);
+  if (t) {
+    t.unread = false;
+    t.view.scrollTop = t.view.scrollHeight;
+  }
+  tabs.forEach((x) => x.view.classList.toggle("hidden", x.id !== id));
   renderTabs();
   updateComposer();
+  updateToEnd();
   input.focus();
 }
 
@@ -188,7 +254,8 @@ function renderTabs() {
     const b = document.createElement("button");
     b.className = "tab" + (t.id === activeId ? " active" : "");
     const icon = t.type === "terminal" ? "⌨️" : t.type === "history" ? "🕘" : "💬";
-    b.innerHTML = `<span class="ti">${icon} ${t.title}</span>`;
+    const dot = t.unread ? `<span class="dot" title="New messages"></span>` : "";
+    b.innerHTML = `<span class="ti">${icon} ${t.title}</span>${dot}`;
     const x = document.createElement("span");
     x.className = "x";
     x.textContent = "×";
@@ -252,24 +319,63 @@ function updateComposer() {
   }
 }
 
-// ———————————————————— window open/close ————————————————————
+// ———————————————————— window open/close + resize ————————————————————
 const isOpen = () => panel.classList.contains("open");
+
+// The window's target geometry when open: a preset size centred horizontally, or
+// the whole monitor (minus margins for the menu bar) when full-screen.
+async function targetDims() {
+  if (fullscreen) {
+    try {
+      const mon = await currentMonitor();
+      if (mon) {
+        const s = mon.scaleFactor;
+        return {
+          w: mon.size.width / s - 16,
+          h: mon.size.height / s - 36,
+          full: true,
+          x: mon.position.x / s + 8,
+          y: mon.position.y / s + 28,
+        };
+      }
+    } catch {
+      /* fall back to a preset size */
+    }
+  }
+  const base = customSize ?? SIZES[sizeIdx];
+  return { w: base.w, h: base.h, full: false, x: 0, y: 0 };
+}
+
+// Resize/move the OS window, keeping it horizontally centred on its current
+// position (or pinned to the monitor origin when full-screen).
+async function moveResize(w: number, h: number, full = false, x = 0, y = 0) {
+  programmatic = true;
+  try {
+    const scale = await appWindow.scaleFactor();
+    const pos = await appWindow.outerPosition();
+    await appWindow.setSize(new LogicalSize(w, h));
+    if (full) {
+      await appWindow.setPosition(new LogicalPosition(x, y));
+    } else {
+      const centerX = pos.x / scale + curW / 2;
+      await appWindow.setPosition(new LogicalPosition(Math.max(0, centerX - w / 2), pos.y / scale));
+    }
+    curW = w;
+  } catch {
+    /* not in tauri */
+  }
+  setTimeout(() => (programmatic = false), 150);
+}
 
 async function setOpen(open: boolean) {
   if (open === isOpen()) return;
   panel.classList.toggle("open", open);
   mascot.classList.toggle("open", open);
-  const tW = open ? OPEN.w : COLLAPSE.w;
-  const tH = open ? OPEN.h : COLLAPSE.h;
-  try {
-    const scale = await appWindow.scaleFactor();
-    const pos = await appWindow.outerPosition();
-    const centerX = pos.x / scale + curW / 2;
-    await appWindow.setSize(new LogicalSize(tW, tH));
-    await appWindow.setPosition(new LogicalPosition(Math.max(0, centerX - tW / 2), pos.y / scale));
-    curW = tW;
-  } catch {
-    /* not in tauri */
+  if (open) {
+    const d = await targetDims();
+    await moveResize(d.w, d.h, d.full, d.x, d.y);
+  } else {
+    await moveResize(COLLAPSE.w, COLLAPSE.h);
   }
   if (open) {
     face.greet();
@@ -277,6 +383,119 @@ async function setOpen(open: boolean) {
     setTimeout(() => input.focus(), 60);
   }
 }
+
+// Re-apply the current size/fullscreen state to the live window (opening first
+// if needed), then refresh the control buttons.
+async function reapplySize() {
+  if (!isOpen()) {
+    await setOpen(true);
+  } else {
+    const d = await targetDims();
+    await moveResize(d.w, d.h, d.full, d.x, d.y);
+  }
+  updateWinCtrls();
+}
+
+function forgetCustom() {
+  customSize = null;
+  localStorage.removeItem("turbo.custom");
+}
+
+async function changeSize(delta: number) {
+  // Stepping the preset starts from whatever size is showing now.
+  if (customSize) sizeIdx = nearestPreset(customSize.w);
+  fullscreen = false;
+  forgetCustom();
+  sizeIdx = clampIdx(sizeIdx + delta);
+  localStorage.setItem("turbo.size", String(sizeIdx));
+  localStorage.setItem("turbo.fs", "0");
+  await reapplySize();
+}
+
+function nearestPreset(w: number): number {
+  let best = 0;
+  for (let i = 1; i < SIZES.length; i++) {
+    if (Math.abs(SIZES[i].w - w) < Math.abs(SIZES[best].w - w)) best = i;
+  }
+  return best;
+}
+
+async function resetSize() {
+  fullscreen = false;
+  forgetCustom();
+  sizeIdx = 1;
+  localStorage.setItem("turbo.size", "1");
+  localStorage.setItem("turbo.fs", "0");
+  await reapplySize();
+}
+
+async function toggleFullscreen() {
+  fullscreen = !fullscreen;
+  localStorage.setItem("turbo.fs", fullscreen ? "1" : "0");
+  await reapplySize();
+}
+
+function updateWinCtrls() {
+  wcFull.classList.toggle("active", fullscreen);
+  wcFull.textContent = fullscreen ? "⤡" : "⤢";
+  wcFull.title = fullscreen ? "Exit full screen" : "Full screen";
+  wcSmaller.style.opacity = !fullscreen && (customSize || sizeIdx > 0) ? "1" : "0.35";
+  wcBigger.style.opacity = !fullscreen && (customSize || sizeIdx < SIZES.length - 1) ? "1" : "0.35";
+}
+
+wcSmaller.addEventListener("click", () => changeSize(-1));
+wcBigger.addEventListener("click", () => changeSize(1));
+wcFull.addEventListener("click", () => toggleFullscreen());
+
+// Drag handles on the right / bottom / corner edges → native window resize.
+const rzE = document.querySelector<HTMLDivElement>("#rzE")!;
+const rzS = document.querySelector<HTMLDivElement>("#rzS")!;
+const rzSE = document.querySelector<HTMLDivElement>("#rzSE")!;
+function startResize(dir: ResizeDir) {
+  return (e: MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    lastPanelDown = performance.now(); // don't auto-close on the focus blip
+    fullscreen = false;
+    localStorage.setItem("turbo.fs", "0");
+    appWindow.startResizeDragging(dir).catch(() => {});
+  };
+}
+rzE.addEventListener("mousedown", startResize("East"));
+rzS.addEventListener("mousedown", startResize("South"));
+rzSE.addEventListener("mousedown", startResize("SouthEast"));
+
+// Remember a hand-dragged size so it restores next time the panel opens.
+appWindow.onResized(async ({ payload }) => {
+  if (programmatic || fullscreen || !isOpen()) return;
+  try {
+    const scale = await appWindow.scaleFactor();
+    const w = payload.width / scale;
+    const h = payload.height / scale;
+    if (w < 220 || h < 160) return; // ignore collapse / spurious events
+    customSize = { w, h };
+    curW = w;
+    localStorage.setItem("turbo.custom", JSON.stringify(customSize));
+    updateWinCtrls();
+  } catch {
+    /* not in tauri */
+  }
+});
+
+// ⌘/Ctrl +  −  0  to grow / shrink / reset the window.
+window.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+  if (e.key === "=" || e.key === "+") {
+    e.preventDefault();
+    changeSize(1);
+  } else if (e.key === "-" || e.key === "_") {
+    e.preventDefault();
+    changeSize(-1);
+  } else if (e.key === "0") {
+    e.preventDefault();
+    resetSize();
+  }
+});
 
 // close when the window loses focus (click off), unless we just touched the panel
 appWindow.onFocusChanged(({ payload: focused }) => {
@@ -307,21 +526,36 @@ window.addEventListener("mouseup", () => {
 
 // ———————————————————— chat ————————————————————
 function addMsg(t: Tab, kind: "user" | "bot", text = ""): HTMLDivElement {
+  // The user's own message always pins to the bottom; other appends only do so
+  // if you were already there (so reading back isn't interrupted).
+  const stick = kind === "user" || atBottom(t.view);
   const el = document.createElement("div");
   el.className = `msg ${kind}`;
   el.textContent = text;
   t.body.appendChild(el);
-  t.view.scrollTop = t.view.scrollHeight;
+  if (stick) scrollToEnd(t.view);
+  if (t.id === activeId) updateToEnd();
   return el;
 }
 
 async function runChat(t: Tab, text: string) {
   t.busy = true;
   addMsg(t, "user", text);
-  const bot = addMsg(t, "bot", "…");
+  const bot = addMsg(t, "bot", "");
+  // animated "Turbo is thinking" feedback until the first content arrives
+  bot.classList.add("thinking");
+  bot.innerHTML = `<span class="think-dots"><i></i><i></i><i></i></span>`;
   face.set("think");
   let first = true;
   let reply = "";
+  // clear the thinking placeholder the first time any content (text/tool) lands
+  const clearThinking = () => {
+    if (first) {
+      bot.classList.remove("thinking");
+      bot.textContent = "";
+      first = false;
+    }
+  };
   await ask(
     backendSel.value as Backend,
     text,
@@ -329,26 +563,36 @@ async function runChat(t: Tab, text: string) {
     { permissionMode: permSel.value, model: modelSel.value, sessionId: t.sessionId },
     {
       onChunk: (chunk) => {
+        const stick = atBottom(t.view);
         if (first) {
-          bot.textContent = "";
+          clearThinking();
           face.set("talk");
-          first = false;
         }
         reply += chunk;
         bot.textContent = reply;
-        t.view.scrollTop = t.view.scrollHeight;
+        if (stick) scrollToEnd(t.view);
+        if (t.id === activeId) updateToEnd();
       },
       onTool: (line) => {
+        const stick = atBottom(t.view);
+        clearThinking();
         const s = document.createElement("span");
         s.className = "tool";
         s.textContent = `⚙ ${line}`;
         bot.appendChild(s);
-        t.view.scrollTop = t.view.scrollHeight;
+        if (stick) scrollToEnd(t.view);
+        if (t.id === activeId) updateToEnd();
       },
       onDone: (result) => {
         face.set("idle");
         t.busy = false;
+        // a turn that produced nothing visible: drop the empty thinking bubble
+        if (first) {
+          clearThinking();
+          if (!reply.trim()) bot.remove();
+        }
         if (result?.sessionId) t.sessionId = result.sessionId; // remember for next turn
+        t.syncCount = undefined; // re-baseline against the log so we don't echo our own turn
         fx.confetti(22);
         face.hearts();
         if (voiceTurn && reply.trim()) speak(reply.slice(0, 600));
@@ -357,6 +601,7 @@ async function runChat(t: Tab, text: string) {
         saveState();
       },
       onError: (msg) => {
+        clearThinking();
         bot.classList.add("error");
         bot.textContent = msg || "Something went wrong.";
         face.set("error");
@@ -473,6 +718,7 @@ async function reloadSession(s: SessionInfo) {
   t.body.innerHTML = "";
   if (!entries.length) addMsg(t, "bot", "(couldn't load this chat's messages, but I can still continue it)");
   for (const e of entries) addMsg(t, e.role, e.text);
+  t.syncCount = entries.length; // baseline for live sync
   t.view.scrollTop = t.view.scrollHeight;
   saveState();
 }
@@ -498,6 +744,43 @@ function loadState(): boolean {
   }
 }
 
+// ———————————————————— live cross-window sync ————————————————————
+// The same Claude session can be driven from another Turbo window or the
+// `claude` CLI. We poll each chat tab's session log and append anything that
+// shows up that we didn't render ourselves, so open chats stay in step.
+let polling = false;
+async function pollSessions() {
+  if (polling) return;
+  polling = true;
+  try {
+    for (const t of tabs) {
+      if (t.type !== "chat" || !t.sessionId || t.busy) continue;
+      let entries: ChatEntry[];
+      try {
+        entries = await loadSession(t.sessionId);
+      } catch {
+        continue;
+      }
+      // First sight of this tab's log → baseline without re-rendering what's shown.
+      if (t.syncCount === undefined) {
+        t.syncCount = entries.length;
+        continue;
+      }
+      if (entries.length > t.syncCount) {
+        for (const e of entries.slice(t.syncCount)) addMsg(t, e.role, e.text);
+        t.syncCount = entries.length;
+        if (t.id !== activeId) {
+          t.unread = true;
+          renderTabs();
+        }
+        saveState();
+      }
+    }
+  } finally {
+    polling = false;
+  }
+}
+
 // ———————————————————— slash commands ————————————————————
 interface Slash {
   cmd: string;
@@ -507,13 +790,19 @@ interface Slash {
 const COMMANDS: Slash[] = [
   { cmd: "/chat", desc: "New chat tab", run: () => createTab("chat") },
   { cmd: "/terminal", desc: "New terminal tab", run: () => createTab("terminal") },
+  { cmd: "/history", desc: "Browse past chats", run: () => createTab("history") },
   { cmd: "/clear", desc: "Clear this tab", run: () => (active().body.innerHTML = "") },
+  { cmd: "/cwd", desc: "Show the working folder", run: showCwd },
+  { cmd: "/voice", desc: "Toggle “Hey Turbo” voice", run: () => toggleVoice() },
+  { cmd: "/bigger", desc: "Grow the window", run: () => changeSize(1) },
+  { cmd: "/smaller", desc: "Shrink the window", run: () => changeSize(-1) },
+  { cmd: "/fullscreen", desc: "Toggle full screen", run: () => toggleFullscreen() },
+  { cmd: "/persona", desc: "Edit Turbo's personality", run: showPersona },
   { cmd: "/hearts", desc: "Throw some love", run: () => { fx.hearts(16); face.hearts(); } },
   { cmd: "/confetti", desc: "Celebrate!", run: () => fx.confetti(40) },
   { cmd: "/lick", desc: "Turbo licks", run: () => face.licks() },
   { cmd: "/close", desc: "Close this tab", run: () => closeTab(activeId) },
-  { cmd: "/persona", desc: "Edit Turbo's personality", run: showPersona },
-  { cmd: "/help", desc: "List commands", run: showHelp },
+  { cmd: "/help", desc: "List all commands", run: showHelp },
 ];
 
 async function showPersona() {
@@ -521,6 +810,13 @@ async function showPersona() {
   const t = tabs.find((x) => x.type === "chat") ?? createTab("chat");
   selectTab(t.id);
   addMsg(t, "bot", `My personality lives in this file — edit it and I'll change:\n${p}`);
+}
+
+function showCwd() {
+  const cur = active();
+  const t = cur.type === "history" ? (tabs.find((x) => x.type === "chat") ?? createTab("chat")) : cur;
+  selectTab(t.id);
+  addMsg(t, "bot", `Working folder: ${shortCwd(t.cwd)}`);
 }
 let slashItems: Slash[] = [];
 let slashSel = 0;
@@ -775,8 +1071,12 @@ usageEl.addEventListener("click", (e) => {
     /* */
   }
   if (!loadState()) createTab("chat");
+  updateWinCtrls();
+  // restored chats should open scrolled to the latest message
+  for (const t of tabs) t.view.scrollTop = t.view.scrollHeight;
   refreshUsage();
   setInterval(refreshUsage, 30_000);
+  setInterval(pollSessions, 3_000);
   // Resume "Hey Turbo" listening if it was enabled last session.
   if (localStorage.getItem("turbo.voice") === "1") toggleVoice();
 })();
