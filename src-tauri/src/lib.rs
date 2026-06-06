@@ -682,6 +682,192 @@ fn speak(text: String) {
     }
 }
 
+// ———————————————————— git ————————————————————
+
+#[derive(Serialize)]
+pub struct RepoInfo {
+    path: String,
+    name: String,
+}
+
+/// Native folder picker (macOS) — returns the chosen path, or None if cancelled.
+#[tauri::command]
+async fn pick_folder() -> Result<Option<String>, String> {
+    let script =
+        "POSIX path of (choose folder with prompt \"Pick a folder to scan for git repos\")";
+    let out = tokio::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Ok(None); // user cancelled
+    }
+    let p = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    Ok((!p.is_empty()).then_some(p))
+}
+
+/// Find git repositories under `root` (a few levels deep), skipping noisy dirs.
+#[tauri::command]
+fn find_git_repos(root: String) -> Vec<RepoInfo> {
+    fn walk(dir: &std::path::Path, depth: usize, out: &mut Vec<RepoInfo>) {
+        if depth == 0 || out.len() > 200 {
+            return;
+        }
+        if dir.join(".git").exists() {
+            out.push(RepoInfo {
+                path: dir.display().to_string(),
+                name: dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            });
+            return; // don't descend into a repo
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            if n.starts_with('.') || matches!(n.as_ref(), "node_modules" | "target" | "Pods" | "build" | "dist" | "vendor") {
+                continue;
+            }
+            walk(&p, depth - 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(std::path::Path::new(&root), 5, &mut out);
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+/// Run a git command in `repo`, returning combined stdout (or stderr on failure).
+fn run_git(repo: &str, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("PATH", login_path())
+        .output()
+        .map_err(|e| format!("git not found: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if out.status.success() {
+        Ok(stdout)
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        Err(if err.trim().is_empty() { stdout } else { err })
+    }
+}
+
+#[derive(Serialize)]
+pub struct GitFile {
+    status: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+pub struct GitStatus {
+    branch: String,
+    ahead: u32,
+    behind: u32,
+    files: Vec<GitFile>,
+    clean: bool,
+}
+
+/// Branch, ahead/behind, and the list of changed files for a repo.
+#[tauri::command]
+fn git_status(repo: String) -> Result<GitStatus, String> {
+    let raw = run_git(&repo, &["status", "--porcelain=v1", "--branch"])?;
+    let mut branch = String::new();
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
+    let mut files = Vec::new();
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            // e.g. "main...origin/main [ahead 1, behind 2]"
+            branch = rest
+                .split(['.', ' '])
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if let Some(i) = rest.find("ahead ") {
+                ahead = rest[i + 6..].split([',', ']']).next().unwrap_or("0").trim().parse().unwrap_or(0);
+            }
+            if let Some(i) = rest.find("behind ") {
+                behind = rest[i + 7..].split([',', ']']).next().unwrap_or("0").trim().parse().unwrap_or(0);
+            }
+        } else if line.len() > 3 {
+            files.push(GitFile {
+                status: line[..2].trim().to_string(),
+                path: line[3..].to_string(),
+            });
+        }
+    }
+    if branch.is_empty() {
+        branch = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+    }
+    let clean = files.is_empty();
+    Ok(GitStatus { branch, ahead, behind, files, clean })
+}
+
+/// Stage everything and draft a commit message from the diff using Claude.
+#[tauri::command]
+async fn git_ai_message(repo: String) -> Result<String, String> {
+    run_git(&repo, &["add", "-A"])?;
+    let diff = run_git(&repo, &["diff", "--staged"])?;
+    if diff.trim().is_empty() {
+        return Err("Nothing staged to commit.".into());
+    }
+    let clipped: String = diff.chars().take(12000).collect();
+    let prompt = format!(
+        "Write a git commit message for the following diff. Use the Conventional Commits style: \
+a concise one-line summary (max ~70 chars), then a blank line and 1-3 short bullet points if useful. \
+Output ONLY the commit message, no code fences, no preamble.\n\n{clipped}"
+    );
+    let out = tokio::process::Command::new("claude")
+        .arg("-p")
+        .arg(&prompt)
+        .env("PATH", login_path())
+        .output()
+        .await
+        .map_err(|e| format!("Couldn't run claude: {e}"))?;
+    if !out.status.success() {
+        return Err("claude couldn't draft a message.".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Commit whatever is staged with the given message.
+#[tauri::command]
+fn git_commit(repo: String, message: String) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Commit message is empty.".into());
+    }
+    run_git(&repo, &["add", "-A"])?;
+    run_git(&repo, &["commit", "-m", &message])
+}
+
+#[tauri::command]
+fn git_pull(repo: String) -> Result<String, String> {
+    run_git(&repo, &["pull", "--ff-only"])
+}
+
+#[tauri::command]
+fn git_push(repo: String) -> Result<String, String> {
+    run_git(&repo, &["push"])
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -695,7 +881,14 @@ pub fn run() {
             load_session,
             speak,
             start_listening,
-            stop_listening
+            stop_listening,
+            pick_folder,
+            find_git_repos,
+            git_status,
+            git_ai_message,
+            git_commit,
+            git_pull,
+            git_push
         ])
         .setup(|app| {
             if let Some(win) = app.get_webview_window("main") {

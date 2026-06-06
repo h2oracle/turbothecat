@@ -149,6 +149,45 @@ export async function readLimits(): Promise<RateLimit | null> {
   return invoke("read_limits");
 }
 
+// ———————————————————— git ————————————————————
+export interface RepoInfo {
+  path: string;
+  name: string;
+}
+export interface GitFile {
+  status: string;
+  path: string;
+}
+export interface GitStatus {
+  branch: string;
+  ahead: number;
+  behind: number;
+  files: GitFile[];
+  clean: boolean;
+}
+
+export async function pickFolder(): Promise<string | null> {
+  return invoke("pick_folder");
+}
+export async function findGitRepos(root: string): Promise<RepoInfo[]> {
+  return invoke("find_git_repos", { root });
+}
+export async function gitStatus(repo: string): Promise<GitStatus> {
+  return invoke("git_status", { repo });
+}
+export async function gitAiMessage(repo: string): Promise<string> {
+  return invoke("git_ai_message", { repo });
+}
+export async function gitCommit(repo: string, message: string): Promise<string> {
+  return invoke("git_commit", { repo, message });
+}
+export async function gitPull(repo: string): Promise<string> {
+  return invoke("git_pull", { repo });
+}
+export async function gitPush(repo: string): Promise<string> {
+  return invoke("git_push", { repo });
+}
+
 export function currencySymbol(code: string): string {
   switch (code) {
     case "GBP":

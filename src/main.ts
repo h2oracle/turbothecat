@@ -13,9 +13,18 @@ import {
   listSessions,
   loadSession,
   readLimits,
+  pickFolder,
+  findGitRepos,
+  gitStatus,
+  gitAiMessage,
+  gitCommit,
+  gitPull,
+  gitPush,
   type Backend,
   type SessionInfo,
   type ChatEntry,
+  type RepoInfo,
+  type GitStatus,
 } from "./backend";
 import * as fx from "./effects";
 import { renderMarkdown } from "./md";
@@ -162,7 +171,7 @@ let lastInteract = 0; // last time the user touched the cat (to time idle quips)
 const shortCwd = (p: string) => (homePath && p.startsWith(homePath) ? p.replace(homePath, "~") : p);
 
 // ———————————————————— tabs ————————————————————
-type TabType = "chat" | "terminal" | "history";
+type TabType = "chat" | "terminal" | "history" | "git";
 interface Tab {
   id: number;
   type: TabType;
@@ -174,6 +183,7 @@ interface Tab {
   sessionId?: string; // Claude session to resume (chat tabs)
   syncCount?: number; // session entries already shown (for live cross-window sync)
   unread?: boolean; // external messages arrived while this tab was inactive
+  gitRoot?: string; // last scanned folder (git tabs)
 }
 interface RestoreTab {
   type: TabType;
@@ -197,9 +207,11 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
         : "zsh"
       : type === "history"
         ? "History"
-        : n > 1
-          ? `Chat ${n}`
-          : "Chat";
+        : type === "git"
+          ? "Git"
+          : n > 1
+            ? `Chat ${n}`
+            : "Chat";
   const title = restore?.title ?? defaultTitle;
   const view = document.createElement("div");
   view.className = "view";
@@ -207,7 +219,8 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
     if (id === activeId) updateToEnd();
   });
   const body = document.createElement("div");
-  body.className = type === "terminal" ? "term" : type === "history" ? "history" : "log";
+  body.className =
+    type === "terminal" ? "term" : type === "history" ? "history" : type === "git" ? "git" : "log";
   view.appendChild(body);
   views.appendChild(view);
   const tab: Tab = {
@@ -228,6 +241,7 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
     addTerm(tab, `Turbo terminal — ${shortCwd(tab.cwd)}`, "dim");
   }
   if (type === "history") renderHistory(tab);
+  if (type === "git") renderGit(tab);
   if (!restore) saveState();
   return tab;
 }
@@ -266,7 +280,8 @@ function renderTabs() {
   for (const t of tabs) {
     const b = document.createElement("button");
     b.className = "tab" + (t.id === activeId ? " active" : "");
-    const icon = t.type === "terminal" ? "⌨️" : t.type === "history" ? "🕘" : "💬";
+    const icon =
+      t.type === "terminal" ? "⌨️" : t.type === "history" ? "🕘" : t.type === "git" ? "⎇" : "💬";
     const dot = t.unread ? `<span class="dot" title="New messages"></span>` : "";
     b.innerHTML = `<span class="ti">${icon} ${t.title}</span>${dot}`;
     const x = document.createElement("span");
@@ -296,6 +311,7 @@ function openTabMenu(anchor: HTMLElement) {
   tabmenu.innerHTML = `
     <div class="item" data-t="chat">💬 New chat</div>
     <div class="item" data-t="terminal">⌨️ New terminal</div>
+    <div class="item" data-t="git">⎇ Git</div>
     <div class="item" data-t="history">🕘 History</div>`;
   tabmenu.style.left = `${r.left}px`;
   tabmenu.style.top = `${r.bottom + 4}px`;
@@ -317,7 +333,7 @@ document.addEventListener("click", (e) => {
 function updateComposer() {
   const t = active();
   const composer = document.querySelector<HTMLDivElement>(".composer")!;
-  if (t.type === "history") {
+  if (t.type === "history" || t.type === "git") {
     composer.style.display = "none";
     return;
   }
@@ -1193,10 +1209,223 @@ async function reloadSession(s: SessionInfo) {
   saveState();
 }
 
+// ———————————————————— agent activity (face + bubble) ————————————————————
+// Run a backend agent op while Turbo "thinks" (face + a floating bubble), so any
+// running agent — chat, commit-message drafting, etc. — shows she's working.
+let agentDepth = 0;
+async function withAgent<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  agentDepth++;
+  face.set("think");
+  const floating = !isOpen();
+  if (floating) showBubble(label, { thinking: !label });
+  try {
+    return await fn();
+  } finally {
+    agentDepth = Math.max(0, agentDepth - 1);
+    if (agentDepth === 0) face.set("idle");
+    if (floating && !isOpen()) hideBubble();
+  }
+}
+
+// ———————————————————— git tab ————————————————————
+async function renderGit(tab: Tab) {
+  let repos: RepoInfo[] = [];
+  let selected = "";
+  tab.body.innerHTML = `
+    <div class="git-bar">
+      <button class="git-btn" data-act="pick">📁 Choose folder…</button>
+      <span class="git-root"></span>
+    </div>
+    <div class="git-main"></div>`;
+  const rootEl = tab.body.querySelector<HTMLElement>(".git-root")!;
+  const main = tab.body.querySelector<HTMLElement>(".git-main")!;
+  const note = (msg: string) => {
+    main.innerHTML = "";
+    const d = document.createElement("div");
+    d.className = "hinfo";
+    d.textContent = msg;
+    main.appendChild(d);
+  };
+
+  tab.body.querySelector<HTMLButtonElement>('[data-act="pick"]')!.addEventListener("click", async () => {
+    let folder: string | null = null;
+    try {
+      folder = await pickFolder();
+    } catch {
+      /* */
+    }
+    if (folder) {
+      tab.gitRoot = folder;
+      scan();
+    }
+  });
+
+  async function scan() {
+    if (!tab.gitRoot) {
+      note("Pick a folder to find its git repos.");
+      return;
+    }
+    rootEl.textContent = shortCwd(tab.gitRoot);
+    note("Scanning…");
+    try {
+      repos = await findGitRepos(tab.gitRoot);
+    } catch {
+      note("Couldn't scan that folder.");
+      return;
+    }
+    renderList();
+  }
+
+  function renderList() {
+    if (!repos.length) {
+      note("No git repos found in there.");
+      return;
+    }
+    main.innerHTML = `<div class="git-list"></div><div class="git-detail"></div>`;
+    const list = main.querySelector<HTMLElement>(".git-list")!;
+    for (const r of repos) {
+      const el = document.createElement("div");
+      el.className = "git-item" + (r.path === selected ? " sel" : "");
+      const nm = document.createElement("div");
+      nm.className = "gi-name";
+      nm.textContent = `⎇ ${r.name}`;
+      const pa = document.createElement("div");
+      pa.className = "gi-path";
+      pa.textContent = shortCwd(r.path);
+      el.append(nm, pa);
+      el.addEventListener("click", () => {
+        selected = r.path;
+        renderList();
+        showRepo(r.path);
+      });
+      list.appendChild(el);
+    }
+    if (selected) showRepo(selected);
+    else {
+      const d = main.querySelector<HTMLElement>(".git-detail")!;
+      d.innerHTML = `<div class="hinfo">Pick a repo to see its status.</div>`;
+    }
+  }
+
+  async function showRepo(repo: string) {
+    const detail = main.querySelector<HTMLElement>(".git-detail");
+    if (!detail) return;
+    detail.innerHTML = `<div class="hinfo">Loading…</div>`;
+    let st: GitStatus;
+    try {
+      st = await gitStatus(repo);
+    } catch (e) {
+      detail.innerHTML = "";
+      const d = document.createElement("div");
+      d.className = "hinfo";
+      d.textContent = String(e);
+      detail.appendChild(d);
+      return;
+    }
+    detail.innerHTML = "";
+
+    const head = document.createElement("div");
+    head.className = "gd-head";
+    const ab =
+      (st.ahead ? ` ↑${st.ahead}` : "") + (st.behind ? ` ↓${st.behind}` : "");
+    head.innerHTML = `<span class="gd-branch">⎇ ${escapeText(st.branch)}</span><span class="gd-ab">${escapeText(ab)}</span>`;
+    detail.appendChild(head);
+
+    const filesBox = document.createElement("div");
+    filesBox.className = "gd-files";
+    if (st.clean) {
+      filesBox.innerHTML = `<div class="hinfo">Working tree clean ✓</div>`;
+    } else {
+      for (const f of st.files) {
+        const row = document.createElement("div");
+        row.className = "gd-file";
+        const s = document.createElement("span");
+        s.className = "gd-st";
+        s.textContent = f.status || "•";
+        const p = document.createElement("span");
+        p.textContent = f.path;
+        row.append(s, p);
+        filesBox.appendChild(row);
+      }
+    }
+    detail.appendChild(filesBox);
+
+    const msg = document.createElement("textarea");
+    msg.className = "gd-msg";
+    msg.placeholder = "Commit message… (or draft one with ✨)";
+    msg.rows = 3;
+    detail.appendChild(msg);
+
+    const bar = document.createElement("div");
+    bar.className = "gd-actions";
+    const out = document.createElement("div");
+    out.className = "gd-out";
+
+    const mkBtn = (label: string, cls: string, fn: () => Promise<void>) => {
+      const b = document.createElement("button");
+      b.className = "git-btn " + cls;
+      b.textContent = label;
+      b.addEventListener("click", async () => {
+        bar.querySelectorAll("button").forEach((x) => (x.disabled = true));
+        try {
+          await fn();
+        } catch (e) {
+          out.textContent = String(e);
+          out.classList.add("err");
+        } finally {
+          bar.querySelectorAll("button").forEach((x) => (x.disabled = false));
+        }
+      });
+      return b;
+    };
+
+    const ai = mkBtn("✨ Draft", "", async () => {
+      out.classList.remove("err");
+      out.textContent = "Drafting message…";
+      const m = await withAgent("drafting commit…", () => gitAiMessage(repo));
+      msg.value = m;
+      out.textContent = "Drafted — review and commit.";
+    });
+    const commit = mkBtn("✓ Commit", "primary", async () => {
+      out.classList.remove("err");
+      const m = msg.value.trim() || (await withAgent("drafting commit…", () => gitAiMessage(repo)));
+      msg.value = m;
+      out.textContent = "Committing…";
+      const r = await withAgent("", () => gitCommit(repo, m));
+      out.textContent = r.trim() || "Committed ✓";
+      msg.value = "";
+      showRepo(repo);
+    });
+    const pull = mkBtn("⇩ Pull", "", async () => {
+      out.classList.remove("err");
+      out.textContent = "Pulling…";
+      const r = await withAgent("", () => gitPull(repo));
+      out.textContent = r.trim() || "Up to date.";
+      showRepo(repo);
+    });
+    const push = mkBtn("⇧ Push", "", async () => {
+      out.classList.remove("err");
+      out.textContent = "Pushing…";
+      const r = await withAgent("", () => gitPush(repo));
+      out.textContent = r.trim() || "Pushed ✓";
+      showRepo(repo);
+    });
+    const refresh = mkBtn("↻", "", async () => {
+      showRepo(repo);
+    });
+    bar.append(ai, commit, pull, push, refresh);
+    detail.append(bar, out);
+  }
+
+  scan();
+}
+
+const escapeText = (s: string) => s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c] || c);
+
 // ———————————————————— persistence ————————————————————
 function saveState() {
   const snap = tabs
-    .filter((t) => t.type !== "history")
+    .filter((t) => t.type !== "history" && t.type !== "git")
     .map((t) => ({ type: t.type, title: t.title, cwd: t.cwd, sessionId: t.sessionId, html: t.body.innerHTML }));
   const activeIdx = tabs.findIndex((t) => t.id === activeId);
   localStorage.setItem("turbo.tabs", JSON.stringify({ tabs: snap, active: activeIdx }));
