@@ -3,7 +3,6 @@ import { getCurrentWindow, currentMonitor, LogicalSize, LogicalPosition } from "
 import { CatFace } from "./face";
 import {
   ask,
-  runShell,
   homeDir,
   speak,
   fetchUsage,
@@ -24,7 +23,16 @@ import {
   gitFetch,
   gitPull,
   gitPush,
+  ptyOpen,
+  ptyWrite,
+  ptyResize,
+  ptyKill,
+  onPtyData,
+  onPtyExit,
+  ideDiffResult,
+  onIdeDiff,
   type Backend,
+  type IdeDiff,
   type SessionInfo,
   type ChatEntry,
   type RepoInfo,
@@ -32,6 +40,9 @@ import {
 } from "./backend";
 import * as fx from "./effects";
 import { renderMarkdown } from "./md";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 
 const appWindow = getCurrentWindow();
 // Roomy enough for the soft shadow AND the tail that sweeps over her head.
@@ -73,6 +84,7 @@ app.innerHTML = /* html */ `
     </div>
     <div class="views" id="views">
       <button class="toend" id="toEnd" title="Jump to latest">↓</button>
+      <div class="cmd-panel" id="cmdPanel"></div>
     </div>
     <div class="rz rz-e" id="rzE" title="Drag to resize"></div>
     <div class="rz rz-s" id="rzS" title="Drag to resize"></div>
@@ -107,6 +119,7 @@ app.innerHTML = /* html */ `
   <div class="slash" id="slash"></div>
   <div class="tabmenu" id="tabmenu"></div>
   <div class="usagepop" id="usagepop"></div>
+  <div class="ide-diff" id="ideDiff"></div>
 `;
 
 const mascot = document.querySelector<HTMLDivElement>("#mascot")!;
@@ -138,6 +151,8 @@ const wcSmaller = document.querySelector<HTMLButtonElement>("#wcSmaller")!;
 const wcBigger = document.querySelector<HTMLButtonElement>("#wcBigger")!;
 const wcFull = document.querySelector<HTMLButtonElement>("#wcFull")!;
 const toEndBtn = document.querySelector<HTMLButtonElement>("#toEnd")!;
+const cmdPanel = document.querySelector<HTMLDivElement>("#cmdPanel")!;
+const ideDiffEl = document.querySelector<HTMLDivElement>("#ideDiff")!;
 const bubble = document.querySelector<HTMLDivElement>("#bubble")!;
 const bubbleContent = document.querySelector<HTMLSpanElement>("#bubbleContent")!;
 
@@ -171,6 +186,7 @@ let homePath = "/";
 let voiceTurn = false;
 let lastPanelDown = 0;
 let lastInteract = 0; // last time the user touched the cat (to time idle quips)
+let modalOpen = false; // a native dialog (folder picker) is up — don't auto-close
 
 const shortCwd = (p: string) => (homePath && p.startsWith(homePath) ? p.replace(homePath, "~") : p);
 
@@ -188,6 +204,9 @@ interface Tab {
   syncCount?: number; // session entries already shown (for live cross-window sync)
   unread?: boolean; // external messages arrived while this tab was inactive
   gitRoot?: string; // last scanned folder (git tabs)
+  term?: Terminal; // xterm instance (terminal tabs)
+  fit?: FitAddon;
+  ptyId?: string; // backend PTY id (terminal tabs)
 }
 interface RestoreTab {
   type: TabType;
@@ -218,7 +237,7 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
             : "Chat";
   const title = restore?.title ?? defaultTitle;
   const view = document.createElement("div");
-  view.className = "view";
+  view.className = "view" + (type === "terminal" ? " is-term" : "");
   view.addEventListener("scroll", () => {
     if (id === activeId) updateToEnd();
   });
@@ -233,16 +252,16 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
     title,
     view,
     body,
-    cwd: restore?.cwd ?? homePath,
+    cwd: restore?.cwd || homePath, // empty cwd → home (|| not ?? on purpose)
     busy: false,
     sessionId: restore?.sessionId,
   };
   tabs.push(tab);
   selectTab(id);
-  if (restore?.html !== undefined) {
+  if (type === "terminal") {
+    mountTerminal(tab);
+  } else if (restore?.html !== undefined) {
     body.innerHTML = restore.html;
-  } else if (type === "terminal") {
-    addTerm(tab, `Turbo terminal — ${shortCwd(tab.cwd)}`, "dim");
   }
   if (type === "history") renderHistory(tab);
   if (type === "git") renderGit(tab);
@@ -253,6 +272,8 @@ function createTab(type: TabType, restore?: RestoreTab): Tab {
 function closeTab(id: number) {
   const i = tabs.findIndex((t) => t.id === id);
   if (i < 0) return;
+  if (tabs[i].ptyId) ptyKill(tabs[i].ptyId!).catch(() => {});
+  tabs[i].term?.dispose();
   tabs[i].view.remove();
   tabs.splice(i, 1);
   if (!tabs.length) {
@@ -269,14 +290,25 @@ function selectTab(id: number) {
   const t = tabs.find((x) => x.id === id);
   if (t) {
     t.unread = false;
-    // defer so the now-visible view is laid out before we jump to the bottom
-    requestAnimationFrame(() => scrollToEnd(t.view));
+    // refresh on switch: re-scan history, re-poll a chat for new messages
+    if (t.type === "history") renderHistory(t);
+    else if (t.type === "chat" && t.sessionId) pollSessions();
+    // defer so the now-visible view is laid out before we act on it
+    requestAnimationFrame(() => {
+      if (t.type === "terminal") {
+        fitTerm(t);
+        t.term?.focus();
+      } else {
+        scrollToEnd(t.view);
+      }
+    });
   }
   tabs.forEach((x) => x.view.classList.toggle("hidden", x.id !== id));
   renderTabs();
   updateComposer();
   updateToEnd();
-  input.focus();
+  cmdPanel.classList.toggle("show", t?.type === "terminal");
+  if (t?.type !== "terminal") input.focus();
 }
 
 function renderTabs() {
@@ -313,7 +345,8 @@ function renderTabs() {
 function openTabMenu(anchor: HTMLElement) {
   const r = anchor.getBoundingClientRect();
   tabmenu.innerHTML = `
-    <div class="item" data-t="chat">💬 New chat</div>
+    <div class="item" data-t="chat">💬 New chat <span class="item-tag">SDK credit</span></div>
+    <div class="item" data-t="claude">🐈 Claude (plan) <span class="item-tag">Max</span></div>
     <div class="item" data-t="terminal">⌨️ New terminal</div>
     <div class="item" data-t="git">⎇ Git</div>
     <div class="item" data-t="history">🕘 History</div>`;
@@ -324,7 +357,8 @@ function openTabMenu(anchor: HTMLElement) {
     el.addEventListener("mousedown", (e) => {
       e.preventDefault();
       tabmenu.classList.remove("open");
-      createTab(el.dataset.t as TabType);
+      if (el.dataset.t === "claude") launchClaudePlan();
+      else createTab(el.dataset.t as TabType);
     }),
   );
 }
@@ -337,16 +371,13 @@ document.addEventListener("click", (e) => {
 function updateComposer() {
   const t = active();
   const composer = document.querySelector<HTMLDivElement>(".composer")!;
-  if (t.type === "history" || t.type === "git") {
+  if (t.type === "history" || t.type === "git" || t.type === "terminal") {
+    // terminal takes input directly via xterm; the others are read-only views
     composer.style.display = "none";
     return;
   }
   composer.style.display = "";
-  if (t.type === "terminal") {
-    cwdEl.style.display = "";
-    cwdEl.textContent = `${shortCwd(t.cwd)} $`;
-    input.placeholder = "run a command…";
-  } else {
+  {
     cwdEl.style.display = "none";
     input.placeholder = "Ask Turbo anything…";
   }
@@ -806,14 +837,22 @@ window.addEventListener("keydown", (e) => {
 
 // close when the window loses focus (click off), unless we just touched the panel
 appWindow.onFocusChanged(({ payload: focused }) => {
-  if (!focused && isOpen() && performance.now() - lastPanelDown > 400) setOpen(false);
+  if (!focused && isOpen() && !modalOpen && performance.now() - lastPanelDown > 400) setOpen(false);
 });
 panel.addEventListener("mousedown", () => (lastPanelDown = performance.now()));
-// clicking the empty (transparent) area around the chat also minimizes it
+// clicking the empty (transparent) area around the chat also minimizes it —
+// but not when clicking the panel, the cat, or any popup (tab menu / slash / usage)
 app.addEventListener("mousedown", (e) => {
   if (!isOpen()) return;
   const target = e.target as Node;
-  if (panel.contains(target) || mascot.contains(target)) return;
+  if (
+    panel.contains(target) ||
+    mascot.contains(target) ||
+    tabmenu.contains(target) ||
+    slashEl.contains(target) ||
+    usagePop.contains(target)
+  )
+    return;
   setOpen(false);
 });
 
@@ -1021,7 +1060,9 @@ async function runChat(t: Tab, text: string) {
   await ask(
     backendSel.value as Backend,
     text,
-    null,
+    // run in the session's own folder so `--resume` can find it (Claude scopes
+    // sessions per project/cwd); falls back to the tab's cwd / home otherwise
+    t.cwd || null,
     { permissionMode: permSel.value, model: modelSel.value, sessionId: t.sessionId },
     {
       onChunk: (chunk) => {
@@ -1103,54 +1144,186 @@ async function runChat(t: Tab, text: string) {
   );
 }
 
-// ———————————————————— terminal ————————————————————
-function addTerm(t: Tab, text: string, cls = "") {
-  const span = document.createElement("span");
-  if (cls) span.className = cls;
-  span.textContent = text + "\n";
-  t.body.appendChild(span);
-  t.view.scrollTop = t.view.scrollHeight;
-}
+// ———————————————————— terminal (real PTY via xterm) ————————————————————
+const b64ToBytes = (b64: string): Uint8Array => {
+  const s = atob(b64);
+  const a = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+  return a;
+};
 
-async function runTerminal(t: Tab, cmd: string) {
-  t.busy = true;
-  pushCmd(cmd);
-  addTerm(t, `${shortCwd(t.cwd)} $ ${cmd}`, "cmd");
-  face.set("think");
+// Fit the xterm to its container and tell the PTY the new size.
+function fitTerm(t: Tab) {
+  if (!t.term || !t.fit || !t.ptyId) return;
   try {
-    const res = await runShell(cmd, t.cwd, (line) => addTerm(t, line));
-    t.cwd = res.cwd || t.cwd;
-    if (res.code !== 0) addTerm(t, `[exit ${res.code}]`, "err");
-    if (active().id === t.id) updateComposer();
-  } catch (e) {
-    addTerm(t, String(e), "err");
+    t.fit.fit();
+    ptyResize(t.ptyId, t.term.cols, t.term.rows).catch(() => {});
+  } catch {
+    /* */
   }
-  face.set("idle");
-  t.busy = false;
-  saveState();
 }
 
-// ———————————————————— terminal command history ————————————————————
-let cmdHistory: string[] = [];
-try {
-  cmdHistory = JSON.parse(localStorage.getItem("turbo.cmdhist") || "[]");
-} catch {
-  cmdHistory = [];
+// Mount a real terminal in the tab, backed by a login shell in a PTY. Running
+// `claude` here is interactive → billed to your plan, not the Agent SDK credit.
+function mountTerminal(t: Tab) {
+  const term = new Terminal({
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: 12,
+    cursorBlink: true,
+    allowProposedApi: true,
+    scrollback: 5000,
+    theme: {
+      background: "#0c0d12",
+      foreground: "#cfd6e6",
+      cursor: "#5ee0c8",
+      selectionBackground: "rgba(94,224,200,0.3)",
+    },
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(t.body);
+  const id = `pty-${t.id}`;
+  t.term = term;
+  t.fit = fit;
+  t.ptyId = id;
+  term.onData((d) => ptyWrite(id, d).catch(() => {}));
+  term.onResize(({ cols, rows }) => ptyResize(id, cols, rows).catch(() => {}));
+  requestAnimationFrame(() => {
+    try {
+      fit.fit();
+    } catch {
+      /* */
+    }
+    ptyOpen(id, t.cwd || homePath, term.cols || 80, term.rows || 24).catch((e) =>
+      term.write(`\r\n\x1b[31m[couldn't start terminal: ${e}]\x1b[0m\r\n`),
+    );
+    term.focus();
+  });
 }
-let cmdIdx = cmdHistory.length;
 
-function pushCmd(c: string) {
-  if (!c.trim()) return;
-  cmdHistory = cmdHistory.filter((x) => x !== c);
-  cmdHistory.push(c);
-  if (cmdHistory.length > 200) cmdHistory = cmdHistory.slice(-200);
-  localStorage.setItem("turbo.cmdhist", JSON.stringify(cmdHistory));
-  cmdIdx = cmdHistory.length;
+// Open a terminal and start interactive `claude` in it — this is a Claude chat
+// that bills to your Max plan limits (interactive), not the Agent SDK credit.
+function launchClaudePlan(cwd?: string) {
+  const t = createTab("terminal");
+  if (cwd) t.cwd = cwd;
+  // give the login shell a moment to be ready, then run claude
+  setTimeout(() => {
+    if (t.ptyId) ptyWrite(t.ptyId, "claude\n").catch(() => {});
+  }, 700);
 }
-function recallCmd(dir: number) {
-  if (active().type !== "terminal" || !cmdHistory.length) return;
-  cmdIdx = Math.max(0, Math.min(cmdHistory.length, cmdIdx + dir));
-  input.value = cmdHistory[cmdIdx] ?? "";
+
+// ———————————————————— terminal command palette ————————————————————
+const CMD_GROUPS: { title: string; cmds: string[] }[] = [
+  { title: "Shell", cmds: ["ls -la", "pwd", "cd ..", "clear", "df -h", "du -sh *", 'find . -name ""', 'grep -rn "" .'] },
+  { title: "Node / npm", cmds: ["npm install", "npm run dev", "npm run build", "npm start", "npx ", "pnpm install", "pnpm dev", "yarn"] },
+  { title: "Flutter", cmds: ["flutter run", "flutter pub get", "flutter build apk", "flutter clean", "flutter doctor", "flutter devices"] },
+  { title: "PHP / Laravel", cmds: ["php -v", "composer install", "composer update", "php artisan serve", "php artisan migrate"] },
+  { title: "Git", cmds: ["git status", "git pull", "git push", "git add -A", 'git commit -m ""', "git log --oneline -20"] },
+  { title: "System", cmds: ["brew update", "brew install ", "ps aux | grep ", "lsof -i :3000", "kill -9 "] },
+];
+
+const loadCustomCmds = (): string[] => {
+  try {
+    return JSON.parse(localStorage.getItem("turbo.customcmds") || "[]");
+  } catch {
+    return [];
+  }
+};
+const saveCustomCmds = (list: string[]) => localStorage.setItem("turbo.customcmds", JSON.stringify(list));
+
+function insertCmd(c: string) {
+  const t = active();
+  if (!t || t.type !== "terminal" || !t.ptyId) return;
+  // type the command into the shell (no newline) so you can edit, then Enter
+  ptyWrite(t.ptyId, c).catch(() => {});
+  t.term?.focus();
+}
+
+function renderCmdPanel() {
+  cmdPanel.innerHTML = "";
+  let openSet: Set<string>;
+  try {
+    openSet = new Set<string>(JSON.parse(localStorage.getItem("turbo.cmdopen") || '["Shell"]'));
+  } catch {
+    openSet = new Set(["Shell"]);
+  }
+  const groups = [...CMD_GROUPS.map((g) => ({ ...g, custom: false })), { title: "Custom", cmds: loadCustomCmds(), custom: true }];
+
+  for (const g of groups) {
+    const sec = document.createElement("div");
+    sec.className = "cmd-sec";
+    const h = document.createElement("button");
+    h.className = "cmd-h";
+    const open = openSet.has(g.title);
+    h.innerHTML = `<span>${g.title}</span><span class="cmd-caret">${open ? "▾" : "▸"}</span>`;
+    const list = document.createElement("div");
+    list.className = "cmd-list";
+    if (!open) list.style.display = "none";
+    h.addEventListener("click", () => {
+      const isOpen = list.style.display !== "none";
+      list.style.display = isOpen ? "none" : "";
+      h.querySelector(".cmd-caret")!.textContent = isOpen ? "▸" : "▾";
+      if (isOpen) openSet.delete(g.title);
+      else openSet.add(g.title);
+      localStorage.setItem("turbo.cmdopen", JSON.stringify([...openSet]));
+    });
+    sec.append(h, list);
+
+    for (const c of g.cmds) {
+      const row = document.createElement("div");
+      row.className = "cmd-row";
+      const b = document.createElement("button");
+      b.className = "cmd-item";
+      b.textContent = c;
+      b.title = c;
+      b.addEventListener("click", () => insertCmd(c));
+      row.appendChild(b);
+      if (g.custom) {
+        const x = document.createElement("span");
+        x.className = "cmd-x";
+        x.textContent = "×";
+        x.title = "Remove";
+        x.addEventListener("click", (e) => {
+          e.stopPropagation();
+          saveCustomCmds(loadCustomCmds().filter((v) => v !== c));
+          renderCmdPanel();
+        });
+        row.appendChild(x);
+      }
+      list.appendChild(row);
+    }
+
+    if (g.custom) {
+      const add = document.createElement("div");
+      add.className = "cmd-add";
+      const inp = document.createElement("input");
+      inp.className = "cmd-addin";
+      inp.placeholder = "add a command…";
+      const commit = () => {
+        const v = inp.value.trim();
+        if (!v) return;
+        const cur = loadCustomCmds();
+        if (!cur.includes(v)) {
+          cur.push(v);
+          saveCustomCmds(cur);
+          renderCmdPanel();
+        }
+      };
+      inp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+        }
+      });
+      const btn = document.createElement("button");
+      btn.className = "cmd-addbtn";
+      btn.textContent = "+";
+      btn.addEventListener("click", commit);
+      add.append(inp, btn);
+      list.appendChild(add);
+    }
+    cmdPanel.appendChild(sec);
+  }
 }
 
 // ———————————————————— history tab ————————————————————
@@ -1231,6 +1404,81 @@ async function withAgent<T>(label: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// ———————————————————— IDE diff approval (Claude → Turbo) ————————————————————
+// Claude (running in our terminal, connected as IDE) asks us to show a diff and
+// accept/reject it. We render a simple line diff with Accept / Reject.
+type DiffLine = { t: " " | "+" | "-"; l: string };
+function lineDiff(oldStr: string, newStr: string): DiffLine[] {
+  const a = oldStr.split("\n");
+  const b = newStr.split("\n");
+  const n = a.length;
+  const m = b.length;
+  if (n * m > 4_000_000) return b.map((l) => ({ t: "+", l })); // too big → show new only
+  const dp: Uint32Array[] = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ t: " ", l: a[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ t: "-", l: a[i++] });
+    } else {
+      out.push({ t: "+", l: b[j++] });
+    }
+  }
+  while (i < n) out.push({ t: "-", l: a[i++] });
+  while (j < m) out.push({ t: "+", l: b[j++] });
+  return out;
+}
+
+let diffQueue: IdeDiff[] = [];
+let diffShowing = false;
+function enqueueDiff(d: IdeDiff) {
+  diffQueue.push(d);
+  if (!diffShowing) showNextDiff();
+}
+function showNextDiff() {
+  const d = diffQueue.shift();
+  if (!d) {
+    diffShowing = false;
+    ideDiffEl.classList.remove("open");
+    return;
+  }
+  diffShowing = true;
+  setOpen(true); // make sure the window is visible
+  const added = lineDiff(d.old, d.new);
+  const isNew = !d.old;
+  const body = added
+    .map((dl) => {
+      const cls = dl.t === "+" ? "add" : dl.t === "-" ? "del" : "ctx";
+      const esc = escapeText(dl.l);
+      return `<span class="dl ${cls}">${dl.t}${esc || " "}</span>`;
+    })
+    .join("\n");
+  ideDiffEl.innerHTML = `
+    <div class="ide-card">
+      <div class="ide-head">🐈 Claude wants to ${isNew ? "create" : "edit"} <b>${escapeText(d.path.split("/").pop() || d.path)}</b></div>
+      <pre class="ide-body">${body}</pre>
+      <div class="ide-actions">
+        <button class="git-btn" data-act="reject">Reject</button>
+        <button class="git-btn primary" data-act="accept">Accept</button>
+      </div>
+    </div>`;
+  const resolve = (accept: boolean) => {
+    ideDiffResult(d.id, accept).catch(() => {});
+    showNextDiff();
+  };
+  ideDiffEl.querySelector<HTMLButtonElement>('[data-act="accept"]')!.onclick = () => resolve(true);
+  ideDiffEl.querySelector<HTMLButtonElement>('[data-act="reject"]')!.onclick = () => resolve(false);
+  ideDiffEl.classList.add("open");
+}
+
 // ———————————————————— git tab ————————————————————
 async function renderGit(tab: Tab) {
   let repos: RepoInfo[] = [];
@@ -1253,10 +1501,14 @@ async function renderGit(tab: Tab) {
 
   tab.body.querySelector<HTMLButtonElement>('[data-act="pick"]')!.addEventListener("click", async () => {
     let folder: string | null = null;
+    modalOpen = true; // keep the chat open while the system dialog is up
     try {
       folder = await pickFolder();
     } catch {
       /* */
+    } finally {
+      modalOpen = false;
+      lastPanelDown = performance.now();
     }
     if (folder) {
       tab.gitRoot = folder;
@@ -1488,7 +1740,7 @@ const escapeText = (s: string) => s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">"
 // ———————————————————— persistence ————————————————————
 function saveState() {
   const snap = tabs
-    .filter((t) => t.type !== "history" && t.type !== "git")
+    .filter((t) => t.type === "chat")
     .map((t) => ({ type: t.type, title: t.title, cwd: t.cwd, sessionId: t.sessionId, html: t.body.innerHTML }));
   const activeIdx = tabs.findIndex((t) => t.id === activeId);
   localStorage.setItem("turbo.tabs", JSON.stringify({ tabs: snap, active: activeIdx }));
@@ -1550,7 +1802,8 @@ interface Slash {
   run: () => void;
 }
 const COMMANDS: Slash[] = [
-  { cmd: "/chat", desc: "New chat tab", run: () => createTab("chat") },
+  { cmd: "/chat", desc: "New chat (Agent SDK credit)", run: () => createTab("chat") },
+  { cmd: "/claude", desc: "Claude on your Max plan (terminal)", run: () => launchClaudePlan() },
   { cmd: "/terminal", desc: "New terminal tab", run: () => createTab("terminal") },
   { cmd: "/history", desc: "Browse past chats", run: () => createTab("history") },
   { cmd: "/clear", desc: "Clear this tab", run: () => (active().body.innerHTML = "") },
@@ -1631,11 +1884,10 @@ async function submit() {
   const text = input.value.trim();
   if (!text) return;
   const t = active();
-  if (t.busy) return;
+  if (t.busy || t.type !== "chat") return; // terminal input goes straight to xterm
   input.value = "";
   hideSlash();
-  if (t.type === "chat") await runChat(t, text);
-  else await runTerminal(t, text);
+  await runChat(t, text);
 }
 
 input.addEventListener("input", updateSlash);
@@ -1654,18 +1906,6 @@ input.addEventListener("keydown", (e) => {
       return;
     }
     if (e.key === "Escape") return hideSlash();
-  } else if (active().type === "terminal") {
-    // recall previous commands in a terminal tab
-    if (e.key === "ArrowUp") {
-      e.preventDefault();
-      recallCmd(-1);
-      return;
-    }
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      recallCmd(1);
-      return;
-    }
   }
   if (e.key === "Enter") submit();
   else if (e.key === "Escape") setOpen(false);
@@ -1839,8 +2079,26 @@ usageEl.addEventListener("click", (e) => {
   } catch {
     /* */
   }
+  // route PTY output to the matching terminal tab
+  onPtyData((id, b64) => {
+    const t = tabs.find((x) => x.ptyId === id);
+    t?.term?.write(b64ToBytes(b64));
+  });
+  onPtyExit((id) => {
+    const t = tabs.find((x) => x.ptyId === id);
+    t?.term?.write("\r\n\x1b[90m[process exited — close the tab]\x1b[0m\r\n");
+  });
+  // Claude (IDE bridge) asking us to approve a diff
+  onIdeDiff((d) => enqueueDiff(d));
+  // keep the active terminal fitted to the window as it resizes
+  new ResizeObserver(() => {
+    const t = tabs.find((x) => x.id === activeId);
+    if (t?.type === "terminal") fitTerm(t);
+  }).observe(views);
+
   if (!loadState()) createTab("chat");
   updateWinCtrls();
+  renderCmdPanel();
   layoutCollapsed(COLLAPSE.w); // centre the floating cat
   // restored chats should open scrolled to the latest message
   for (const t of tabs) t.view.scrollTop = t.view.scrollHeight;

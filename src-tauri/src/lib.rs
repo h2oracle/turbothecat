@@ -5,12 +5,20 @@
 
 mod usage;
 
+use base64::Engine;
+use futures_util::{SinkExt, StreamExt};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tauri::{Emitter, Manager, PhysicalPosition};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::process::Command;
+use tokio::sync::oneshot;
+use tokio_tungstenite::tungstenite::Message;
 
 /// The native "Hey Turbo" listener bundle (built by scripts/build-listener.sh).
 /// Launched via `open` so macOS reads its Info.plist and shows the mic/speech
@@ -154,6 +162,9 @@ async fn run_agent_once(
     let mut cmd = match backend.as_str() {
         "claude" => {
             let mut c = Command::new("claude");
+            // Use the logged-in Claude plan (Agent SDK credit), not a stray API key
+            // that would bill pay-per-token.
+            c.env_remove("ANTHROPIC_API_KEY");
             c.arg("-p")
                 .arg(&prompt)
                 .arg("--output-format")
@@ -870,6 +881,7 @@ Output ONLY the commit message, no code fences, no preamble.\n\n{clipped}"
         .arg("-p")
         .arg(&prompt)
         .env("PATH", login_path())
+        .env_remove("ANTHROPIC_API_KEY") // use the plan, not a pay-per-token key
         .output()
         .await
         .map_err(|e| format!("Couldn't run claude: {e}"))?;
@@ -930,6 +942,275 @@ fn git_push(repo: String) -> Result<String, String> {
     run_git(&repo, &["push"])
 }
 
+// ———————————————————— IDE bridge (Claude Code IDE integration) ————————————————————
+// Turbo acts as an "IDE": it runs a WebSocket MCP server and drops a lock file in
+// ~/.claude/ide/<port>.lock, so an interactive `claude` (run in our terminal with
+// CLAUDE_CODE_SSE_PORT set) connects to us — letting Claude show diffs in Turbo.
+// NOTE: this protocol is undocumented/reverse-engineered; expect to iterate.
+
+fn ide_info() -> &'static OnceLock<(u16, String)> {
+    static I: OnceLock<(u16, String)> = OnceLock::new();
+    &I
+}
+fn ide_workspace() -> &'static Mutex<String> {
+    static W: OnceLock<Mutex<String>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(std::env::var("HOME").unwrap_or_else(|_| "/".into())))
+}
+fn ide_pending() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
+    static P: OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+static IDE_DIFF_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn rand_token() -> String {
+    let mut b = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut b);
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The frontend resolves an openDiff request (accept = apply the edit).
+#[tauri::command]
+fn ide_diff_result(id: String, accept: bool) {
+    if let Some(tx) = ide_pending().lock().unwrap().remove(&id) {
+        let _ = tx.send(accept);
+    }
+}
+
+/// Start the IDE WebSocket server + write the lock file. Best-effort.
+fn start_ide_server(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return,
+        };
+        let token = rand_token();
+        let _ = ide_info().set((port, token.clone()));
+
+        // write ~/.claude/ide/<port>.lock
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = std::path::PathBuf::from(home).join(".claude").join("ide");
+            let _ = std::fs::create_dir_all(&dir);
+            let ws = ide_workspace().lock().unwrap().clone();
+            let lock = serde_json::json!({
+                "pid": std::process::id(),
+                "workspaceFolders": [ws],
+                "ideName": "Turbo",
+                "transport": "ws",
+                "authToken": token,
+            });
+            let _ = std::fs::write(dir.join(format!("{port}.lock")), lock.to_string());
+        }
+
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (mut tx, mut rx) = ws.split();
+                while let Some(Ok(msg)) = rx.next().await {
+                    if let Message::Text(t) = msg {
+                        if let Some(resp) = handle_ide_rpc(t.as_str(), &app2).await {
+                            if tx.send(Message::Text(resp.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn ide_tool_list() -> serde_json::Value {
+    let tool = |name: &str, desc: &str| {
+        serde_json::json!({
+            "name": name, "description": desc,
+            "inputSchema": {"type": "object", "properties": {}}
+        })
+    };
+    serde_json::json!({
+        "tools": [
+            tool("openDiff", "Show a diff and ask the user to accept or reject it."),
+            tool("getDiagnostics", "Return language diagnostics (none in Turbo)."),
+            tool("getOpenEditors", "Return open editors (none in Turbo)."),
+            tool("getWorkspaceFolders", "Return the workspace folder."),
+            tool("getCurrentSelection", "Return the editor selection (none in Turbo)."),
+            tool("closeAllDiffTabs", "Close diff tabs."),
+            tool("close_tab", "Close a tab."),
+            tool("saveDocument", "Save a document."),
+            tool("checkDocumentDirty", "Whether a document has unsaved changes."),
+        ]
+    })
+}
+
+fn text_result(s: &str) -> serde_json::Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": s }] })
+}
+
+async fn handle_ide_rpc(text: &str, app: &AppHandle) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let method = v.get("method").and_then(|m| m.as_str())?; // notifications/responses → ignore if no method
+    let id = v.get("id").cloned();
+    let reply = |result: serde_json::Value| {
+        Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
+    };
+
+    match method {
+        "initialize" => reply(serde_json::json!({
+            "protocolVersion": v.pointer("/params/protocolVersion").and_then(|p| p.as_str()).unwrap_or("2025-06-18"),
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "Turbo", "version": "0.1.0" },
+        })),
+        "ping" => reply(serde_json::json!({})),
+        "tools/list" => reply(ide_tool_list()),
+        "tools/call" => {
+            let name = v.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
+            let args = v.pointer("/params/arguments").cloned().unwrap_or(serde_json::Value::Null);
+            match name {
+                "openDiff" => {
+                    let new_path = args.get("new_file_path").and_then(|x| x.as_str()).unwrap_or("");
+                    let old_path = args.get("old_file_path").and_then(|x| x.as_str()).unwrap_or("");
+                    let new_c = args.get("new_file_contents").and_then(|x| x.as_str()).unwrap_or("");
+                    let old_c = std::fs::read_to_string(if old_path.is_empty() { new_path } else { old_path }).unwrap_or_default();
+                    let did = format!("diff-{}", IDE_DIFF_SEQ.fetch_add(1, Ordering::Relaxed));
+                    let (tx, rx) = oneshot::channel();
+                    ide_pending().lock().unwrap().insert(did.clone(), tx);
+                    let _ = app.emit(
+                        "turbo://ide-diff",
+                        serde_json::json!({ "id": did, "path": if new_path.is_empty() { old_path } else { new_path }, "old": old_c, "new": new_c }).to_string(),
+                    );
+                    let accepted = rx.await.unwrap_or(false);
+                    reply(text_result(if accepted { "FILE_SAVED" } else { "DIFF_REJECTED" }))
+                }
+                "getWorkspaceFolders" => {
+                    let ws = ide_workspace().lock().unwrap().clone();
+                    reply(text_result(&serde_json::json!({ "workspaceFolders": [ws] }).to_string()))
+                }
+                "getDiagnostics" => reply(text_result("[]")),
+                "getOpenEditors" => reply(text_result(&serde_json::json!({ "tabs": [] }).to_string())),
+                "getCurrentSelection" => reply(text_result(&serde_json::json!({ "success": false }).to_string())),
+                _ => reply(text_result("OK")),
+            }
+        }
+        _ => id.map(|_| serde_json::json!({ "jsonrpc": "2.0", "id": v.get("id").cloned(), "result": {} }).to_string()),
+    }
+}
+
+// ———————————————————— PTY terminal ————————————————————
+// A real pseudo-terminal so you can run *interactive* programs (like `claude`),
+// which bill to your plan's interactive limits rather than the Agent SDK credit.
+struct PtySession {
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+fn pty_sessions() -> &'static Mutex<HashMap<String, PtySession>> {
+    static S: OnceLock<Mutex<HashMap<String, PtySession>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Open a login shell in a PTY of the given size; streams output as base64 via
+/// `turbo://pty` ({id,data}) and signals exit via `turbo://pty-exit`.
+#[tauri::command]
+fn pty_open(
+    window: tauri::Window,
+    id: String,
+    cwd: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let sys = native_pty_system();
+    let pair = sys
+        .openpty(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| e.to_string())?;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.arg("-i");
+    cmd.arg("-l");
+    let dir = cwd
+        .filter(|d| !d.is_empty() && std::path::Path::new(d).is_dir())
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "/".into());
+    cmd.cwd(&dir);
+    cmd.env("PATH", login_path());
+    cmd.env("TERM", "xterm-256color");
+    // let `claude` in this shell connect to Turbo as its IDE
+    *ide_workspace().lock().unwrap() = dir.clone();
+    if let Some((port, _)) = ide_info().get() {
+        cmd.env("CLAUDE_CODE_SSE_PORT", port.to_string());
+        cmd.env("ENABLE_IDE_INTEGRATION", "true");
+    }
+
+    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+
+    let win = window.clone();
+    let rid = id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                    let _ = win.emit("turbo://pty", serde_json::json!({ "id": rid, "data": data }).to_string());
+                }
+            }
+        }
+        let _ = win.emit("turbo://pty-exit", rid);
+    });
+
+    pty_sessions()
+        .lock()
+        .unwrap()
+        .insert(id, PtySession { writer, master: pair.master, child });
+    Ok(())
+}
+
+/// Send keystrokes / text to a PTY.
+#[tauri::command]
+fn pty_write(id: String, data: String) -> Result<(), String> {
+    let mut map = pty_sessions().lock().unwrap();
+    let s = map.get_mut(&id).ok_or("no such pty")?;
+    s.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    let _ = s.writer.flush();
+    Ok(())
+}
+
+/// Resize a PTY to match the terminal viewport.
+#[tauri::command]
+fn pty_resize(id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let map = pty_sessions().lock().unwrap();
+    if let Some(s) = map.get(&id) {
+        s.master
+            .resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Kill a PTY's process and drop the session.
+#[tauri::command]
+fn pty_kill(id: String) {
+    if let Some(mut s) = pty_sessions().lock().unwrap().remove(&id) {
+        let _ = s.child.kill();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -954,7 +1235,12 @@ pub fn run() {
             git_log,
             git_fetch,
             git_pull,
-            git_push
+            git_push,
+            pty_open,
+            pty_write,
+            pty_resize,
+            pty_kill,
+            ide_diff_result
         ])
         .setup(|app| {
             if let Some(win) = app.get_webview_window("main") {
@@ -966,6 +1252,7 @@ pub fn run() {
                     }
                 }
             }
+            start_ide_server(app.handle().clone()); // Claude Code IDE bridge
             Ok(())
         })
         .run(tauri::generate_context!())

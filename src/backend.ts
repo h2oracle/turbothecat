@@ -200,6 +200,53 @@ export async function gitPush(repo: string): Promise<string> {
   return invoke("git_push", { repo });
 }
 
+// ———————————————————— PTY terminal ————————————————————
+export async function ptyOpen(id: string, cwd: string | null, cols: number, rows: number): Promise<void> {
+  return invoke("pty_open", { id, cwd, cols, rows });
+}
+export async function ptyWrite(id: string, data: string): Promise<void> {
+  return invoke("pty_write", { id, data });
+}
+export async function ptyResize(id: string, cols: number, rows: number): Promise<void> {
+  return invoke("pty_resize", { id, cols, rows });
+}
+export async function ptyKill(id: string): Promise<void> {
+  return invoke("pty_kill", { id });
+}
+export async function onPtyData(cb: (id: string, dataB64: string) => void): Promise<UnlistenFn> {
+  return listen<string>("turbo://pty", (e) => {
+    try {
+      const m = JSON.parse(e.payload);
+      cb(m.id, m.data);
+    } catch {
+      /* */
+    }
+  });
+}
+export async function onPtyExit(cb: (id: string) => void): Promise<UnlistenFn> {
+  return listen<string>("turbo://pty-exit", (e) => cb(e.payload));
+}
+
+// ———————————————————— IDE bridge ————————————————————
+export interface IdeDiff {
+  id: string;
+  path: string;
+  old: string;
+  new: string;
+}
+export async function ideDiffResult(id: string, accept: boolean): Promise<void> {
+  return invoke("ide_diff_result", { id, accept });
+}
+export async function onIdeDiff(cb: (d: IdeDiff) => void): Promise<UnlistenFn> {
+  return listen<string>("turbo://ide-diff", (e) => {
+    try {
+      cb(JSON.parse(e.payload));
+    } catch {
+      /* */
+    }
+  });
+}
+
 export function currencySymbol(code: string): string {
   switch (code) {
     case "GBP":
